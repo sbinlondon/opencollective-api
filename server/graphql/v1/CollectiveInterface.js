@@ -556,6 +556,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       isHost: { type: GraphQLBoolean },
       isIncognito: { type: GraphQLBoolean },
       canApply: { type: GraphQLBoolean },
+      canContact: { type: GraphQLBoolean },
       isArchived: { type: GraphQLBoolean },
       isApproved: { type: GraphQLBoolean },
       isDeletable: { type: GraphQLBoolean },
@@ -966,7 +967,14 @@ const CollectiveFields = () => {
       description: 'Returns whether this host accepts applications for new collectives',
       type: GraphQLBoolean,
       resolve(collective) {
-        return Boolean(collective.settings && collective.settings.apply);
+        return collective.canApply();
+      },
+    },
+    canContact: {
+      description: 'Returns whether this collectives can be contacted',
+      type: GraphQLBoolean,
+      resolve(collective, _, req) {
+        return collective.canContact(req.remoteUser);
       },
     },
     isIncognito: {
@@ -1023,13 +1031,13 @@ const CollectiveFields = () => {
         }
 
         if (collective.ParentCollectiveId) {
-          return req.loaders.collective.findById
-            .load(collective.ParentCollectiveId)
-            .then(
-              parentCollective =>
-                parentCollective.HostCollectiveId &&
-                req.loaders.collective.findById.load(parentCollective.HostCollectiveId),
-            );
+          return req.loaders.collective.findById.load(collective.ParentCollectiveId).then(parentCollective => {
+            if (parentCollective && parentCollective.HostCollectiveId) {
+              return req.loaders.collective.findById.load(parentCollective.HostCollectiveId);
+            } else {
+              return null;
+            }
+          });
         }
 
         return null;
@@ -1364,7 +1372,7 @@ const CollectiveFields = () => {
         if (args.status) query.where.status = args.status;
         if (args.limit) query.limit = args.limit;
         if (args.offset) query.offset = args.offset;
-        query.order = [['incurredAt', 'DESC']];
+        query.order = [['createdAt', 'DESC']];
         const getCollectiveIds = () => {
           // if is host, we get all the expenses across all the hosted collectives
           if (args.includeHostedCollectives) {
@@ -1685,6 +1693,10 @@ export const CollectiveSearchResultsType = new GraphQLObjectType({
   name: 'CollectiveSearchResults',
   description: 'The results from searching for collectives with pagination info',
   fields: () => ({
+    id: {
+      type: GraphQLString,
+      description: 'A unique identifier for this search (for caching)',
+    },
     collectives: {
       type: new GraphQLList(CollectiveType),
     },

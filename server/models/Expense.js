@@ -1,5 +1,5 @@
 import { get, set } from 'lodash';
-import Historical from 'sequelize-historical';
+import Temporal from 'sequelize-temporal';
 import { TransactionTypes } from '../constants/transactions';
 import activities from '../constants/activities';
 import status from '../constants/expense_status';
@@ -57,8 +57,9 @@ export default function(Sequelize, DataTypes) {
         type: DataTypes.STRING,
         validate: {
           isIn: {
+            // donation is deprecated but we keep it in the model because of existing entries
             args: [['paypal', 'manual', 'donation', 'other']],
-            msg: 'Must be paypal, manual, donation or other',
+            msg: 'Must be paypal or other. Deprecated: donation and manual.',
           },
         },
         allowNull: false,
@@ -290,7 +291,7 @@ export default function(Sequelize, DataTypes) {
     return reduceArrayToCurrency(arr, baseCurrency);
   };
 
-  Historical(Expense, Sequelize);
+  Temporal(Expense, Sequelize);
 
   return Expense;
 }

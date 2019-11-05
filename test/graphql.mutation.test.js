@@ -37,10 +37,12 @@ describe('Mutation Tests', () => {
         .then(SubscriptionId => order.update({ SubscriptionId, processedAt: new Date() }))
         .then(() => models.Collective.findByPk(order.CollectiveId))
         .then(collective =>
-          collective.addUserWithRole(user, roles.BACKER, {
-            MemberCollectiveId: order.FromCollectiveId,
-            TierId: order.TierId,
-          }),
+          collective.addUserWithRole(
+            user,
+            roles.BACKER,
+            { MemberCollectiveId: order.FromCollectiveId, TierId: order.TierId },
+            { order },
+          ),
         );
     });
   });
@@ -166,11 +168,10 @@ describe('Mutation Tests', () => {
         const result = await utils.graphqlQuery(createCollectiveQuery, { collective: event }, user1);
         result.errors && console.error(result.errors[0]);
         const createdEvent = result.data.createCollective;
-        expect(createdEvent.slug).to.equal('brusselstogether-meetup-3-5ev');
+        expect(createdEvent.slug).to.contain('brusselstogether-meetup');
         expect(createdEvent.tiers.length).to.equal(event.tiers.length);
         expect(createdEvent.isActive).to.be.true;
         event.id = createdEvent.id;
-        event.slug = 'newslug';
         event.tiers = createdEvent.tiers;
 
         // Make sure the creator of the event has been added as an ADMIN
@@ -220,7 +221,6 @@ describe('Mutation Tests', () => {
 
         const r4 = await utils.graphqlQuery(updateQuery, { collective: event }, user1);
         const updatedEvent = r4.data.editCollective;
-        expect(updatedEvent.slug).to.equal(`${event.slug}-${event.ParentCollectiveId}ev`);
         expect(updatedEvent.tiers.length).to.equal(event.tiers.length);
         expect(updatedEvent.tiers[0].amount).to.equal(event.tiers[0].amount);
       });
@@ -249,6 +249,7 @@ describe('Mutation Tests', () => {
       });
 
       it("fails to create a collective on a host that doesn't accept applications", async () => {
+        await host.collective.update({ settings: { apply: false } });
         const collective = {
           name: 'new collective',
           HostCollectiveId: host.CollectiveId,
@@ -963,13 +964,14 @@ describe('Mutation Tests', () => {
         `;
 
           const order = {
-            user: { email: 'newuser@email.com' },
             collective: { id: event1.id },
             tier: { id: 3 },
             quantity: 2,
           };
-
-          const result = await utils.graphqlQuery(query, { order });
+          const remoteUser = await models.User.createUserWithCollective({
+            email: 'newuser@email.com',
+          });
+          const result = await utils.graphqlQuery(query, { order }, remoteUser);
           expect(result).to.deep.equal({
             data: {
               createOrder: {
@@ -984,7 +986,7 @@ describe('Mutation Tests', () => {
                   },
                 },
                 createdByUser: {
-                  email: null,
+                  email: 'newuser@email.com',
                   id: 5,
                 },
               },
@@ -1160,9 +1162,6 @@ describe('Mutation Tests', () => {
           `;
 
           const order = {
-            user: {
-              email: 'newuser@email.com',
-            },
             paymentMethod: {
               token: 'tok_123456781234567812345678',
               name: '4242',
@@ -1175,7 +1174,8 @@ describe('Mutation Tests', () => {
             tier: { id: 4 },
             quantity: 2,
           };
-          const result = await utils.graphqlQuery(query, { order });
+          const remoteUser = await models.User.createUserWithCollective({ email: 'newuser@email.com' });
+          const result = await utils.graphqlQuery(query, { order }, remoteUser);
           result.errors && console.error(result.errors[0]);
           const executeOrderArgument = executeOrderStub.firstCall.args;
           expect(result).to.deep.equal({
@@ -1192,7 +1192,7 @@ describe('Mutation Tests', () => {
                   },
                 },
                 createdByUser: {
-                  email: null,
+                  email: 'newuser@email.com',
                   id: 5,
                 },
                 collective: {

@@ -31,6 +31,7 @@ import { maxInteger } from '../../constants/math';
 import intervals from '../../constants/intervals';
 import roles from '../../constants/roles';
 import { isUserTaxFormRequiredBeforePayment } from '../../lib/tax-forms';
+import { getCollectiveAvatarUrl } from '../../lib/collectivelib';
 
 /**
  * Take a graphql type and return a wrapper type that adds pagination. The pagination
@@ -362,6 +363,17 @@ export const ContributorRoleEnum = new GraphQLEnumType({
   }, {}),
 });
 
+export const ImageFormatType = new GraphQLEnumType({
+  name: 'ImageFormat',
+  values: {
+    txt: {},
+    png: {},
+    jpg: {},
+    gif: {},
+    svg: {},
+  },
+});
+
 export const ContributorType = new GraphQLObjectType({
   name: 'Contributor',
   description: `
@@ -386,38 +398,23 @@ export const ContributorType = new GraphQLObjectType({
     isAdmin: {
       type: new GraphQLNonNull(GraphQLBoolean),
       description: 'True if the contributor is a collective admin',
-      resolve(contributor) {
-        return contributor.roles.includes(roles.ADMIN);
-      },
     },
     isCore: {
       type: new GraphQLNonNull(GraphQLBoolean),
       description: 'True if the contributor is a core contributor',
-      resolve(contributor) {
-        return contributor.roles.some(role => role === roles.MEMBER || role === roles.ADMIN);
-      },
     },
     isBacker: {
       type: new GraphQLNonNull(GraphQLBoolean),
       description: 'True if the contributor is a financial contributor',
-      resolve(contributor) {
-        return contributor.roles.includes(roles.BACKER);
-      },
     },
     isFundraiser: {
       type: new GraphQLNonNull(GraphQLBoolean),
       description: 'True if the contributor is a core contributor (admin)',
-      resolve(contributor) {
-        return contributor.roles.includes(roles.FUNDRAISER);
-      },
     },
     tiersIds: {
       type: new GraphQLNonNull(new GraphQLList(GraphQLInt)),
       description:
         'A list of tier ids that this contributors is a member of. A null value indicates that a membership without tier.',
-      resolve(contributor) {
-        return contributor.tiersIds || [];
-      },
     },
     since: {
       type: new GraphQLNonNull(IsoDateString),
@@ -447,9 +444,28 @@ export const ContributorType = new GraphQLObjectType({
         return contributor.isIncognito ? null : contributor.collectiveSlug;
       },
     },
+    collectiveId: {
+      type: GraphQLInt,
+      description: 'Null for incognito collectives otherwise collective id',
+      resolve(contributor) {
+        // Don't return the collective id if the contributor wants to be incognito
+        return contributor.isIncognito ? null : contributor.id;
+      },
+    },
     image: {
       type: GraphQLString,
       description: 'Contributor avatar or logo',
+      args: {
+        height: { type: GraphQLInt },
+        format: { type: ImageFormatType },
+      },
+      resolve(contributor, args) {
+        if (!contributor.collectiveSlug) {
+          return null;
+        } else {
+          return getCollectiveAvatarUrl(contributor.collectiveSlug, contributor.type, contributor.image, args);
+        }
+      },
     },
     publicMessage: {
       type: GraphQLString,
@@ -1347,7 +1363,7 @@ export const TierType = new GraphQLObjectType({
       endsAt: {
         type: DateString,
         resolve(tier) {
-          return tier.startsAt;
+          return tier.endsAt;
         },
       },
       collective: {
@@ -1398,7 +1414,7 @@ export const TierType = new GraphQLObjectType({
           },
         },
         resolve(tier, args) {
-          return getContributorsForTier(tier.id, { limit: args.limit });
+          return getContributorsForTier(tier.CollectiveId, tier.id, { limit: args.limit });
         },
       },
       stats: {
@@ -2069,17 +2085,6 @@ export const PaginatedExpensesType = new GraphQLObjectType({
 });
 
 export const PaginatedPaymentMethodsType = paginatedList(PaymentMethodType, 'PaymentMethod', 'paymentMethods');
-
-export const ImageFormatType = new GraphQLEnumType({
-  name: 'ImageFormat',
-  values: {
-    txt: {},
-    png: {},
-    jpg: {},
-    gif: {},
-    svg: {},
-  },
-});
 
 export const StripeErrorType = new GraphQLObjectType({
   name: 'StripeError',

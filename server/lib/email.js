@@ -16,7 +16,7 @@ import { md5 } from './utils';
 const debug = debugLib('email');
 
 export const getMailer = () => {
-  if (process.env.MAILDEV) {
+  if (config.maildev.client) {
     return nodemailer.createTransport({
       ignoreTLS: true,
       port: 1025,
@@ -162,6 +162,7 @@ const sendMessage = (recipients, subject, html, options = {}) => {
   if (mailer) {
     return new Promise((resolve, reject) => {
       const from = options.from || config.email.from;
+      const replyTo = options.replyTo;
       const cc = options.cc;
       const bcc = options.bcc;
       const text = options.text;
@@ -170,6 +171,9 @@ const sendMessage = (recipients, subject, html, options = {}) => {
       // only attach tag in production to keep data clean
       const tag = config.env === 'production' ? options.tag : 'internal';
       const headers = { 'X-Mailgun-Tag': tag, 'X-Mailgun-Dkim': 'yes' };
+      if (replyTo) {
+        headers['Reply-To'] = replyTo;
+      }
       debug('mailer> sending email to ', to, 'bcc', bcc);
 
       return mailer.sendMail({ from, cc, to, bcc, subject, text, html, headers, attachments }, (err, info) => {

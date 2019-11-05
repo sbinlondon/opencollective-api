@@ -2,7 +2,7 @@ import moment from 'moment';
 import uuidv4 from 'uuid/v4';
 import debugLib from 'debug';
 import Promise from 'bluebird';
-import { pick, omit, get, isNil } from 'lodash';
+import { omit, get, isNil } from 'lodash';
 import config from 'config';
 import * as LibTaxes from '@opencollective/taxes';
 
@@ -219,6 +219,10 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
       tier = await models.Tier.findByPk(order.tier.id);
       if (!tier) {
         throw new Error(`No tier found with tier id: ${order.tier.id} for collective slug ${order.collective.slug}`);
+      } else if (tier.CollectiveId !== collective.id) {
+        throw new Error(
+          `This tier (#${tier.id}) doesn't belong to the given Collective (${collective.name} #${collective.id})`,
+        );
       }
     }
 
@@ -257,10 +261,13 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
       if (existingUser) {
         throw new Error('An account already exists for this email address. Please login.');
       }
+      if (!remoteUser) {
+        throw new Error('You have to be authenticated. Please login.');
+      }
       user = await models.User.createUserWithCollective({
         ...order.user,
         currency: order.currency,
-        CreatedByUserId: remoteUser ? remoteUser.id : null,
+        CreatedByUserId: remoteUser.id,
       });
     } else if (remoteUser) {
       user = remoteUser;
@@ -282,7 +289,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
         throw new Error(`From collective id ${order.fromCollective.id} not found`);
       }
 
-      const possibleRoles = [roles.ADMIN, roles.HOST];
+      const possibleRoles = [roles.ADMIN];
       if (fromCollective.type === types.ORGANIZATION) {
         possibleRoles.push(roles.MEMBER);
       }
@@ -475,11 +482,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
         await orderCreated.setPaymentMethod(order.paymentMethod);
       }
       // also adds the user as a BACKER of collective
-      await libPayments.executeOrder(
-        remoteUser || user,
-        orderCreated,
-        pick(order, ['hostFeePercent', 'platformFeePercent']),
-      );
+      await libPayments.executeOrder(remoteUser || user, orderCreated);
     } else if (!paymentRequired && order.interval && collective.type === types.COLLECTIVE) {
       // create inactive subscription to hold the interval info for the pledge
       const subscription = await models.Subscription.create({
@@ -492,7 +495,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
       // Free ticket, mark as processed and add user as an ATTENDEE
       await orderCreated.update({ status: 'PAID', processedAt: new Date() });
       const UserId = remoteUser ? remoteUser.id : user.id;
-      await collective.addUserWithRole(user, roles.ATTENDEE);
+      await collective.addUserWithRole(user, roles.ATTENDEE, {}, { order: orderCreated });
       await models.Activity.create({
         type: activities.TICKET_CONFIRMED,
         data: {
@@ -601,23 +604,17 @@ export async function confirmOrder(order, remoteUser) {
 }
 
 export async function completePledge(remoteUser, order) {
-  if (!remoteUser) {
-    throw new errors.Unauthorized({
-      message: 'You need to be logged in to update an order',
-    });
-  }
-
   const existingOrder = await models.Order.findOne({
-    where: {
-      id: order.id,
-    },
+    where: { id: order.id },
     include: [{ model: models.Collective, as: 'collective' }, { model: models.Collective, as: 'fromCollective' }],
   });
 
   if (!existingOrder) {
-    throw new errors.NotFound({
-      message: 'Existing order not found',
-    });
+    throw new errors.NotFound({ message: "This order doesn't exist" });
+  } else if (!remoteUser || !remoteUser.isAdmin(existingOrder.FromCollectiveId)) {
+    throw new errors.Unauthorized({ message: "You don't have the permissions to edit this order" });
+  } else if (existingOrder.status !== status.PENDING) {
+    throw new errors.NotFound({ message: 'This pledge has already been completed' });
   }
 
   const paymentRequired = order.totalAmount > 0 && existingOrder.collective.isActive;
@@ -635,14 +632,16 @@ export async function completePledge(remoteUser, order) {
   }
 
   if (paymentRequired) {
+    existingOrder.totalAmount = order.totalAmount;
     existingOrder.interval = order.interval;
+    existingOrder.currency = order.currency;
     if (get(order, 'paymentMethod.type') === 'manual') {
       existingOrder.paymentMethod = order.paymentMethod;
     } else {
       await existingOrder.setPaymentMethod(order.paymentMethod);
     }
     // also adds the user as a BACKER of collective
-    await libPayments.executeOrder(remoteUser, existingOrder, pick(order, ['hostFeePercent', 'platformFeePercent']));
+    await libPayments.executeOrder(remoteUser, existingOrder);
   }
   await existingOrder.reload();
   return existingOrder;
@@ -841,11 +840,14 @@ export async function refundTransaction(_, args, req) {
   const HostCollectiveId = isHost ? collective.id : await collective.getHostCollectiveId();
 
   // 1. Verify user permission. User must be either
-  //   a. User that created transaction (within 24h) -- Not implemented yet
-  //   b. Host Collective receiving the donation
-  //   c. Site Admin
+  //   a. Admin of the collective that received the donation - disabled for now
+  //   b. Admin of the Host Collective that received the donation
+  //   c. Admin of opencollective.com/opencollective
 
-  if (!req.remoteUser.isAdmin(HostCollectiveId) && !req.remoteUser.isRoot()) {
+  if (
+    !req.remoteUser.isAdmin(HostCollectiveId) &&
+    !req.remoteUser.isRoot() /* && !req.remoteUser.isAdmin(collective.id) */
+  ) {
     throw new errors.Unauthorized({ message: 'Not a site admin or host collective admin' });
   }
 
@@ -938,6 +940,35 @@ export async function markOrderAsPaid(remoteUser, id) {
   return order;
 }
 
+export async function markPendingOrderAsExpired(remoteUser, id) {
+  if (!remoteUser) {
+    throw new errors.Unauthorized();
+  }
+
+  // fetch the order
+  const order = await models.Order.findByPk(id);
+  if (!order) {
+    throw new errors.NotFound({ message: 'Order not found' });
+  }
+
+  if (order.status !== 'PENDING') {
+    throw new errors.ValidationFailed({
+      message: "The order's status must be PENDING",
+    });
+  }
+
+  const HostCollectiveId = await models.Collective.getHostCollectiveId(order.CollectiveId);
+  if (!remoteUser.isAdmin(HostCollectiveId)) {
+    throw new errors.Unauthorized({
+      message: 'You must be logged in as an admin of the host of the collective',
+    });
+  }
+
+  order.status = 'EXPIRED';
+  await order.save();
+  return order;
+}
+
 export async function addFundsToCollective(order, remoteUser) {
   if (!remoteUser) {
     throw new Error('You need to be logged in to add fund to collective');
@@ -981,6 +1012,14 @@ export async function addFundsToCollective(order, remoteUser) {
     fromCollective = await models.Collective.findByPk(order.fromCollective.id);
     if (!fromCollective) {
       throw new Error(`From collective id ${order.fromCollective.id} not found`);
+    } else if ([types.COLLECTIVE, types.EVENT].includes(fromCollective.type)) {
+      const isAdminOfFromCollective = remoteUser.isRoot() || remoteUser.isAdmin(fromCollective.id);
+      if (!isAdminOfFromCollective && fromCollective.HostCollectiveId !== HostCollectiveId) {
+        const fromCollectiveHostId = await fromCollective.getHostCollectiveId();
+        if (!remoteUser.isAdmin(fromCollectiveHostId)) {
+          throw new Error("You don't have the permission to add funds from collectives you don't own or host.");
+        }
+      }
     }
   } else {
     fromCollective = await models.Collective.createOrganization(order.fromCollective, user, remoteUser);
@@ -994,21 +1033,27 @@ export async function addFundsToCollective(order, remoteUser) {
     currency: collective.currency,
     description: order.description,
     status: status.PENDING,
+    data: {},
   };
 
+  // Handle specific fees
+  if (order.hostFeePercent) {
+    orderData.data.hostFeePercent = order.hostFeePercent;
+  }
+  if (order.platformFeePercent) {
+    orderData.data.platformFeePercent = order.platformFeePercent;
+  }
+
   const orderCreated = await models.Order.create(orderData);
+
   await orderCreated.setPaymentMethod(order.paymentMethod);
 
   try {
-    await libPayments.executeOrder(
-      remoteUser || user,
-      orderCreated,
-      pick(order, ['hostFeePercent', 'platformFeePercent']),
-    );
+    await libPayments.executeOrder(remoteUser || user, orderCreated);
   } catch (e) {
     // Don't save new card for user if order failed
     if (!order.paymentMethod.id && !order.paymentMethod.uuid) {
-      await orderCreated.paymentMethod.update({ CollectiveId: null });
+      await orderCreated.paymentMethod.destroy();
     }
     throw e;
   }

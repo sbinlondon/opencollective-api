@@ -5,11 +5,9 @@ import statuses from '../../../constants/expense_status';
 import activities from '../../../constants/activities';
 import models from '../../../models';
 import paymentProviders from '../../../paymentProviders';
+import * as libPayments from '../../../lib/payments';
 import { formatCurrency } from '../../../lib/utils';
-import {
-  createFromPaidExpense as createTransactionFromPaidExpense,
-  createTransactionFromInKindDonation,
-} from '../../../lib/transactions';
+import { createFromPaidExpense as createTransactionFromPaidExpense } from '../../../lib/transactions';
 import { getFxRate } from '../../../lib/currency';
 import debugLib from 'debug';
 
@@ -19,10 +17,20 @@ const debug = debugLib('expenses');
  * Only admin of expense.collective or of expense.collective.host can approve/reject expenses
  */
 function canUpdateExpenseStatus(remoteUser, expense) {
-  if (remoteUser.hasRole([roles.HOST, roles.ADMIN], expense.CollectiveId)) {
+  if (remoteUser.hasRole([roles.ADMIN], expense.CollectiveId)) {
     return true;
   }
-  if (remoteUser.hasRole([roles.HOST, roles.ADMIN], expense.collective.HostCollectiveId)) {
+  if (remoteUser.hasRole([roles.ADMIN], expense.collective.HostCollectiveId)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Only admin of expense.collective.host can mark expenses unpaid
+ */
+function canMarkExpenseUnpaid(remoteUser, expense) {
+  if (remoteUser.hasRole([roles.ADMIN], expense.collective.HostCollectiveId)) {
     return true;
   }
   return false;
@@ -280,15 +288,10 @@ export async function payExpense(remoteUser, expenseId, fees = {}) {
   }
   const host = await expense.collective.getHostCollective();
 
-  // Expenses in kind can be made for collectives without any
-  // funds. That's why we skip earlier here.
   if (expense.payoutMethod === 'donation') {
-    const transaction = await createTransactionFromPaidExpense(host, null, expense, null, expense.UserId);
-    await createTransactionFromInKindDonation(transaction);
-    const user = await models.User.findByPk(expense.UserId);
-    await expense.collective.addUserWithRole(user, 'BACKER');
-    return markExpenseAsPaid(expense);
+    throw new Error('"In kind" donations are not supported anymore');
   }
+
   const balance = await expense.collective.getBalance();
 
   if (expense.amount > balance) {
@@ -347,4 +350,46 @@ export async function payExpense(remoteUser, expenseId, fees = {}) {
   }
 
   return markExpenseAsPaid(expense);
+}
+
+export async function markExpenseAsUnpaid(remoteUser, ExpenseId, processorFeeRefunded) {
+  if (!remoteUser) {
+    throw new errors.Unauthorized('You need to be logged in to unpay an expense');
+  }
+
+  const expense = await models.Expense.findByPk(ExpenseId, {
+    include: [{ model: models.Collective, as: 'collective' }, { model: models.User, as: 'User' }],
+  });
+
+  if (!expense) {
+    throw new errors.NotFound('No expense found');
+  }
+
+  if (!canMarkExpenseUnpaid(remoteUser, expense)) {
+    throw new errors.Unauthorized("You don't have permission to mark this expense as unpaid");
+  }
+
+  if (expense.status !== statuses.PAID) {
+    throw new errors.Unauthorized('Expense has not been paid yet');
+  }
+
+  if (expense.payoutMethod !== 'other') {
+    throw new errors.Unauthorized('Only expenses with "other" payout method can be marked as unpaid');
+  }
+
+  const transaction = await models.Transaction.findOne({
+    where: { ExpenseId },
+    include: [{ model: models.Expense }],
+  });
+
+  const paymentProcessorFeeInHostCurrency = processorFeeRefunded ? transaction.paymentProcessorFeeInHostCurrency : 0;
+  const refundedTransaction = await libPayments.createRefundTransaction(
+    transaction,
+    paymentProcessorFeeInHostCurrency,
+    null,
+    expense.User,
+  );
+  await libPayments.associateTransactionRefundId(transaction, refundedTransaction);
+
+  return expense.update({ status: statuses.APPROVED, lastEditedById: remoteUser.id });
 }

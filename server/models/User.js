@@ -8,7 +8,6 @@ import { Op } from 'sequelize';
 
 import logger from '../lib/logger';
 import * as auth from '../lib/auth';
-import errors from '../lib/errors';
 import userLib from '../lib/userlib';
 import roles from '../constants/roles';
 import { isValidEmail } from '../lib/utils';
@@ -34,6 +33,7 @@ export default (Sequelize, DataTypes) => {
 
       email: {
         type: DataTypes.STRING,
+        allowNull: false,
         unique: true, // need that? http://stackoverflow.com/questions/16356856/sequelize-js-custom-validator-check-for-unique-username-password
         set(val) {
           if (val && val.toLowerCase) {
@@ -130,12 +130,19 @@ export default (Sequelize, DataTypes) => {
         defaultValue: Sequelize.NOW,
       },
 
-      seenAt: DataTypes.DATE,
+      lastLoginAt: {
+        type: DataTypes.DATE,
+      },
 
       newsletterOptIn: {
         allowNull: false,
         defaultValue: false,
         type: DataTypes.BOOLEAN,
+      },
+
+      data: {
+        type: DataTypes.JSON,
+        allowNull: true,
       },
     },
     {
@@ -256,7 +263,8 @@ export default (Sequelize, DataTypes) => {
   };
 
   User.prototype.generateLoginLink = function(redirect = '/', websiteUrl) {
-    const token = this.jwt({ scope: 'login' });
+    const lastLoginAt = this.lastLoginAt ? this.lastLoginAt.getTime() : null;
+    const token = this.jwt({ scope: 'login', lastLoginAt });
     // if a different websiteUrl is passed
     // we don't accept that in production to avoid fishing related issues
     if (websiteUrl && config.env !== 'production') {
@@ -430,34 +438,6 @@ export default (Sequelize, DataTypes) => {
     return Promise.map(users, u => User.create(defaults({}, u, defaultValues)), { concurrency: 1 });
   };
 
-  User.auth = (email, password, cb) => {
-    if (!email) return cb(new errors.BadRequest(msg));
-
-    const msg = 'Invalid email or password.';
-    email = email.toLowerCase();
-
-    User.find({
-      where: ['email = ?', email],
-    })
-      .then(user => {
-        if (!user) return cb(new errors.BadRequest(msg));
-
-        bcrypt.compare(password, user.password_hash, (err, matched) => {
-          if (!err && matched) {
-            user
-              .updateAttributes({
-                seenAt: new Date(),
-              })
-              .tap(user => cb(null, user))
-              .catch(cb);
-          } else {
-            cb(new errors.BadRequest(msg));
-          }
-        });
-      })
-      .catch(cb);
-  };
-
   User.findOrCreateByEmail = (email, otherAttributes) => {
     if (!isValidEmail(email)) {
       return Promise.reject(new Error('Please provide a valid email address'));
@@ -514,6 +494,7 @@ export default (Sequelize, DataTypes) => {
       isActive: true,
       CreatedByUserId: userData.CreatedByUserId || user.id,
       data: { UserId: user.id },
+      settings: userData.settings,
     };
     user.collective = await models.Collective.create(userCollectiveData, sequelizeParams);
 

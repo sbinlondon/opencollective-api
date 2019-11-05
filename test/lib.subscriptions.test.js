@@ -10,6 +10,7 @@ import models from '../server/models';
 import emailLib from '../server/lib/email';
 import * as paymentsLib from '../server/lib/payments';
 import status from '../server/constants/order_status';
+import { randEmail } from './stores';
 
 // What's being tested
 import {
@@ -24,12 +25,8 @@ import {
 
 async function createOrderWithSubscription(interval, date, quantity = 1) {
   const payment = { amount: 1000, currency: 'USD', interval };
-  const user = await models.User.createUserWithCollective({
-    name: 'Test McTesterson',
-  });
-  const fromCollective = await models.Collective.create({
-    name: 'Donor Collective',
-  });
+  const user = await models.User.createUserWithCollective({ email: randEmail(), name: 'Test McTesterson' });
+  const fromCollective = await models.Collective.create({ email: randEmail(), name: 'Donor Collective' });
   const collective = await models.Collective.create({ name: 'Parcel' });
   const tier = await models.Tier.create({ name: 'backer', amount: 0 });
   const subscription = await models.Subscription.create({
@@ -65,8 +62,8 @@ describe('LibSubscription', () => {
       const order = {
         Subscription: {
           interval: 'month',
-          nextPeriodStart: new Date('2018-01-30'),
-          nextChargeDate: new Date('2018-01-30'),
+          nextPeriodStart: new Date('2018-01-01'),
+          nextChargeDate: new Date('2018-01-01'),
         },
       };
 
@@ -77,6 +74,24 @@ describe('LibSubscription', () => {
       // next month
       expect(updatedDates.nextPeriodStart.getTime()).to.equal(new Date('2018-02-01 0:0').getTime());
       expect(updatedDates.nextChargeDate.getTime()).to.equal(new Date('2018-02-01 0:0').getTime());
+    });
+
+    it('should use the next 2 months first day for monthly subscriptions on or after 15th', () => {
+      // Given the following order with subscription
+      const order = {
+        Subscription: {
+          interval: 'month',
+          nextPeriodStart: new Date('2018-01-30'),
+          nextChargeDate: new Date('2018-01-30'),
+        },
+      };
+
+      // When dates are updated with success
+      const updatedDates = getNextChargeAndPeriodStartDates('new', order);
+
+      // The subscription was made after the 15th the next charge should be in 2 months time, first day.
+      expect(updatedDates.nextPeriodStart.getTime()).to.equal(new Date('2018-03-01 0:0').getTime());
+      expect(updatedDates.nextChargeDate.getTime()).to.equal(new Date('2018-03-01 0:0').getTime());
     });
 
     it('should use first day of the same month next year for yearly subscriptions', () => {
@@ -149,7 +164,7 @@ describe('LibSubscription', () => {
           interval: 'month',
           nextPeriodStart: null,
           nextChargeDate: null,
-          createdAt: new Date('2018-01-30'),
+          createdAt: new Date('2018-01-01'),
         },
       };
 
@@ -506,9 +521,7 @@ describe('LibSubscription', () => {
 
     beforeEach(async () => {
       await utils.resetTestDB();
-      user = await models.User.createUserWithCollective({
-        name: 'Test McTesterson',
-      });
+      user = await models.User.createUserWithCollective({ email: randEmail(), name: 'Test McTesterson' });
       collective = await models.Collective.create({ name: 'Parcel' });
       tier = await models.Tier.create({ name: 'backer', amount: 0 });
     });
@@ -525,10 +538,10 @@ describe('LibSubscription', () => {
       });
 
       // When the orders with pending charges are listed
-      const output = await ordersWithPendingCharges();
+      const { rows } = await ordersWithPendingCharges();
 
       // Then nothing should be returned
-      expect(output.length).to.equal(0);
+      expect(rows.length).to.equal(0);
     });
 
     it('should return orders with subscription active & due', async () => {
@@ -561,11 +574,11 @@ describe('LibSubscription', () => {
       });
 
       // When the orders with pending charges are listed
-      const output = await ordersWithPendingCharges();
+      const { rows } = await ordersWithPendingCharges();
 
       // Then we get just one. The second one doesn't have a
       // subscription id
-      expect(output.length).to.equal(1);
+      expect(rows.length).to.equal(1);
     });
   });
 

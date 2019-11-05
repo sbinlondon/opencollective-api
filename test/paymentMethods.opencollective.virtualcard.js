@@ -103,7 +103,12 @@ describe('opencollective.virtualcard', () => {
           isActive: true,
         }).then(c => (collective1 = c)),
       );
-      before('creates User 1', () => models.User.createUserWithCollective({ name: 'User 1' }).then(u => (user1 = u)));
+      before('creates User 1', () =>
+        models.User.createUserWithCollective({
+          email: store.randEmail(),
+          name: 'User 1',
+        }).then(u => (user1 = u)),
+      );
       before('user1 to become Admin of collective1', () => {
         return models.Member.create({
           CreatedByUserId: user1.id,
@@ -234,17 +239,21 @@ describe('opencollective.virtualcard', () => {
         }).then(pm => (paymentMethod1 = pm)),
       );
 
-      before('creates User 1', () => models.User.createUserWithCollective({ name: 'User 1' }).then(u => (user1 = u)));
-      before('user1 to become Admin of collective1', () => {
-        return models.Member.create({
+      before('creates User 1', () =>
+        models.User.createUserWithCollective({
+          email: store.randEmail(),
+          name: 'User 1',
+        }).then(u => (user1 = u)),
+      );
+
+      before('user1 to become Admin of collective1', () =>
+        models.Member.create({
           CreatedByUserId: user1.id,
           MemberCollectiveId: user1.CollectiveId,
           CollectiveId: collective1.id,
           role: 'ADMIN',
-        }).then(() => {
-          user1.populateRoles();
-        });
-      });
+        }).then(() => user1.populateRoles()),
+      );
 
       before('create a virtual card payment method', () => {
         const createParams = {
@@ -324,7 +333,12 @@ describe('opencollective.virtualcard', () => {
         }).then(c => (collective2 = c)),
       );
 
-      before('creates User 1', () => models.User.createUserWithCollective({ name: 'User 1' }).then(u => (user1 = u)));
+      before('creates User 1', () =>
+        models.User.createUserWithCollective({
+          email: store.randEmail(),
+          name: 'User 1',
+        }).then(u => (user1 = u)),
+      );
       before('user1 to become Admin of collective1', () => {
         return models.Member.create({
           CreatedByUserId: user1.id,
@@ -561,7 +575,7 @@ describe('opencollective.virtualcard', () => {
           currency: CURRENCY,
           isActive: true,
         }).then(c => (targetCollective = c));
-        await targetCollective.addHost(hostCollective);
+        await targetCollective.addHost(hostCollective, user, { shouldAutomaticallyApprove: true });
       });
 
       before(async () => {
@@ -630,7 +644,12 @@ describe('opencollective.virtualcard', () => {
           isActive: true,
         }).then(c => (collective2 = c)),
       );
-      before('creates User 1', () => models.User.createUserWithCollective({ name: 'User 1' }).then(u => (user1 = u)));
+      before('creates User 1', () =>
+        models.User.createUserWithCollective({
+          email: store.randEmail(),
+          name: 'User 1',
+        }).then(u => (user1 = u)),
+      );
       before('user1 to become Admin of collective1', () =>
         models.Member.create({
           CreatedByUserId: user1.id,
@@ -740,7 +759,12 @@ describe('opencollective.virtualcard', () => {
         }).then(pm => (paymentMethod1 = pm)),
       );
 
-      before('creates User 1', () => models.User.createUserWithCollective({ name: 'User 1' }).then(u => (user1 = u)));
+      before('creates User 1', () =>
+        models.User.createUserWithCollective({
+          email: store.randEmail(),
+          name: 'User 1',
+        }).then(u => (user1 = u)),
+      );
       before('user1 to become Admin of collective1', () => {
         return models.Member.create({
           CreatedByUserId: user1.id,
@@ -824,6 +848,7 @@ describe('opencollective.virtualcard', () => {
 
       it('Existing User should claim a virtual card', async () => {
         const existingUser = await models.User.createUserWithCollective({
+          email: store.randEmail(),
           name: 'Existing User',
         });
         // setting correct code to claim virtual card by new User
@@ -917,12 +942,15 @@ describe('opencollective.virtualcard', () => {
         }).then(c => (collective2 = c)),
       );
       before('add hosts', async () => {
-        await collective1.addHost(host1);
-        await collective1.update({ isActive: true });
-        await collective2.addHost(host2);
-        await collective2.update({ isActive: true });
+        await collective1.addHost(host1, user1, { shouldAutomaticallyApprove: true });
+        await collective2.addHost(host2, user1, { shouldAutomaticallyApprove: true });
       });
-      before('creates User 1', () => models.User.createUserWithCollective({ name: 'User 1' }).then(u => (user1 = u)));
+      before('creates User 1', () =>
+        models.User.createUserWithCollective({
+          email: store.randEmail(),
+          name: 'User 1',
+        }).then(u => (user1 = u)),
+      );
       before('user1 to become Admin of collective1', () => {
         return models.Member.create({
           CreatedByUserId: user1.id,
@@ -1099,7 +1127,12 @@ describe('opencollective.virtualcard', () => {
           isActive: true,
         }).then(c => (collective1 = c)),
       );
-      before('creates User 1', () => models.User.createUserWithCollective({ name: 'User 1' }).then(u => (user1 = u)));
+      before('creates User 1', () =>
+        models.User.createUserWithCollective({
+          email: store.randEmail(),
+          name: 'User 1',
+        }).then(u => (user1 = u)),
+      );
       before('user1 to become Admin of collective1', () =>
         models.Member.create({
           CreatedByUserId: user1.id,

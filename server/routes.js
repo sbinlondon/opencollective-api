@@ -12,8 +12,6 @@ import { formatError } from 'apollo-errors';
 import { get } from 'lodash';
 
 import * as connectedAccounts from './controllers/connectedAccounts';
-import * as collectives from './controllers/collectives';
-import * as RestApi from './graphql/v1/restapi';
 import getHomePage from './controllers/homepage';
 import uploadImage from './controllers/images';
 import { createPaymentMethod } from './controllers/paymentMethods';
@@ -40,14 +38,6 @@ import graphqlSchemaV2 from './graphql/v2/schema';
 import helloworks from './controllers/helloworks';
 
 const upload = multer();
-
-const cacheControlMaxAge = maxAge => {
-  maxAge = maxAge || 5;
-  return (req, res, next) => {
-    res.setHeader('Cache-Control', `public, max-age=${maxAge}`);
-    next();
-  };
-};
 
 export default app => {
   /**
@@ -142,7 +132,6 @@ export default app => {
   app.param('transactionuuid', params.transactionuuid);
   app.param('paranoidtransactionid', params.paranoidtransactionid);
   app.param('expenseid', params.expenseid);
-  app.param('idOrUuid', params.idOrUuid);
 
   /**
    * GraphQL v1
@@ -186,6 +175,7 @@ export default app => {
   app.post('/webhooks/stripe', stripeWebhook); // when it gets a new subscription invoice
   app.post('/webhooks/mailgun', email.webhook); // when receiving an email
   app.get('/connected-accounts/:service/callback', aN.authenticateServiceCallback); // oauth callback
+  app.delete('/connected-accounts/:service/disconnect/:collectiveId', aN.authenticateServiceDisconnect);
 
   app.use(sanitizer()); // note: this break /webhooks/mailgun /graphiql
 
@@ -205,19 +195,6 @@ export default app => {
    *  Let's assume for now a paymentMethod is linked to a user.
    */
   app.post('/v1/payment-methods', createPaymentMethod);
-
-  /**
-   * Collectives.
-   */
-  app.get('/groups/:collectiveid/:tierSlug(backers|users)', cacheControlMaxAge(60), collectives.getUsers); // Get collective backers
-
-  /**
-   * Transactions (financial).
-   */
-
-  // Get transactions of a collective given its slug.
-  app.get('/v1/collectives/:collectiveSlug/transactions', RestApi.getLatestTransactions);
-  app.get('/v1/collectives/:collectiveSlug/transactions/:idOrUuid', RestApi.getTransaction);
 
   /**
    * Separate route for uploading images to S3

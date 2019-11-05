@@ -1,4 +1,4 @@
-import Historical from 'sequelize-historical';
+import Temporal from 'sequelize-temporal';
 import config from 'config';
 import deepmerge from 'deepmerge';
 import prependHttp from 'prepend-http';
@@ -37,7 +37,9 @@ import {
   collectiveSlugBlacklist,
   whitelistSettings,
   validateSettings,
+  getCollectiveAvatarUrl,
 } from '../lib/collectivelib';
+import { invalidateContributorsCache } from '../lib/contributors';
 import { capitalize, flattenArray, getDomain, formatCurrency, cleanTags, md5, strip_tags } from '../lib/utils';
 
 import roles from '../constants/roles';
@@ -848,6 +850,27 @@ export default function(Sequelize, DataTypes) {
     });
   };
 
+  /**
+   * If the collective is a host, this function return true in case it's open to applications.
+   * It does **not** check that the collective is indeed a host.
+   */
+  Collective.prototype.canApply = function() {
+    return Boolean(this.settings && this.settings.apply);
+  };
+
+  /**
+   *  Checks if the collective can be contacted by `remoteUser`.
+   */
+  Collective.prototype.canContact = async function(remoteUser) {
+    if (!remoteUser || get(remoteUser.data, 'disableContact', false)) {
+      return false;
+    } else if (!this.isActive) {
+      return false;
+    } else {
+      return [types.COLLECTIVE, types.EVENT].includes(this.type) || (await this.isHost());
+    }
+  };
+
   // This is quite ugly, and only needed for events.
   // I'd argue that we should store the event slug as `${parentCollectiveSlug}/events/${eventSlug}`
   Collective.prototype.getUrlPath = function() {
@@ -857,7 +880,7 @@ export default function(Sequelize, DataTypes) {
       }).then(parent => {
         if (!parent) {
           logger.error(`Event (${this.id}) with an invalid parent (${this.ParentCollectiveId}).`);
-          return `/events/${this.slug}`;
+          return `/collective/events/${this.slug}`;
         }
         return `/${parent.slug}/events/${this.slug}`;
       });
@@ -1148,23 +1171,6 @@ export default function(Sequelize, DataTypes) {
     }).then(member => member.role);
   };
 
-  Collective.prototype.getSuperCollectiveCollectivesIds = function() {
-    if (!this.isSupercollective) return Promise.resolve([this.id]);
-    if (this.superCollectiveCollectivesIds) return Promise.resolve(this.superCollectiveCollectivesIds);
-    return models.Collective.findAll({
-      attributes: ['id'],
-      where: {
-        tags: { [Op.contains]: [this.settings.superCollectiveTag] },
-      },
-    })
-      .then(rows => rows.map(r => r.id))
-      .then(ids => {
-        ids.push(this.id);
-        this.superCollectiveCollectivesIds = ids;
-        return ids;
-      });
-  };
-
   /**
    * returns the tiers with their users
    * e.g. collective.tiers = [
@@ -1249,14 +1255,14 @@ export default function(Sequelize, DataTypes) {
    * @param {*} role
    * @param {*} defaultAttributes
    */
-  Collective.prototype.addUserWithRole = function(user, role, defaultAttributes = {}, transaction) {
+  Collective.prototype.addUserWithRole = async function(user, role, defaultAttributes = {}, context = {}, transaction) {
     if (role === roles.HOST) {
       return logger.info('Please use Collective.addHost(hostCollective, remoteUser);');
     }
 
     const sequelizeParams = transaction ? { transaction } : undefined;
 
-    const member = {
+    const memberAttributes = {
       role,
       CreatedByUserId: user.id,
       MemberCollectiveId: user.CollectiveId,
@@ -1264,119 +1270,118 @@ export default function(Sequelize, DataTypes) {
       ...defaultAttributes,
     };
 
-    debug('addUserWithRole', user.id, role, 'member', member);
-    return Promise.all([
-      models.Member.create(member, sequelizeParams),
-      models.User.findByPk(
-        member.CreatedByUserId,
+    debug('addUserWithRole', user.id, role, 'member', memberAttributes);
+
+    const member = await models.Member.create(memberAttributes, sequelizeParams);
+
+    switch (role) {
+      case roles.BACKER:
+      case roles.ATTENDEE:
+        if (!context.skipActivity) {
+          await this.createMemberCreatedActivity(member, context, sequelizeParams);
+        }
+        break;
+
+      case roles.MEMBER:
+      case roles.ADMIN:
+        await this.sendNewMemberEmail(user, role, member, sequelizeParams);
+        break;
+    }
+
+    return member;
+  };
+
+  Collective.prototype.createMemberCreatedActivity = async function(member, context, sequelizeParams) {
+    // We refetch to preserve historic behavior and make sure it's up to date
+    let order;
+    if (context.order) {
+      order = await models.Order.findOne(
         {
-          include: [{ model: models.Collective, as: 'collective' }],
+          where: { id: context.order.id },
+          include: [{ model: models.Tier }, { model: models.Subscription }],
         },
         sequelizeParams,
-      ),
-      models.User.findByPk(
-        user.id,
-        {
-          include: [{ model: models.Collective, as: 'collective' }],
+      );
+    }
+
+    const urlPath = await this.getUrlPath();
+    const memberCollective = await models.Collective.findByPk(member.MemberCollectiveId, sequelizeParams);
+
+    const data = {
+      collective: { ...this.minimal, urlPath },
+      member: {
+        ...member.info,
+        memberCollective: memberCollective.activity,
+      },
+      order: order && {
+        ...order.activity,
+        tier: order.Tier && order.Tier.minimal,
+        subscription: {
+          interval: order.Subscription && order.Subscription.interval,
         },
-        sequelizeParams,
-      ),
-    ]).then(results => {
-      const member = results[0];
-      const remoteUser = results[1];
-      const memberUser = results[2];
+      },
+    };
 
-      switch (role) {
-        case roles.BACKER:
-        case roles.ATTENDEE:
-        case roles.FOLLOWER:
-          return Promise.props({
-            memberCollective: models.Collective.findByPk(member.MemberCollectiveId, sequelizeParams),
-            order: models.Order.findOne(
-              {
-                where: {
-                  CollectiveId: this.id,
-                  FromCollectiveId: member.MemberCollectiveId,
-                  // status: { [Op.in]: ['ACTIVE', 'PAID'] },
-                },
-                include: [{ model: models.Tier }, { model: models.Subscription }],
-                order: [['createdAt', 'DESC']],
-              },
-              sequelizeParams,
-            ),
-            urlPath: this.getUrlPath(),
-          }).then(({ order, urlPath, memberCollective }) => {
-            const data = {
-              collective: { ...this.minimal, urlPath },
-              member: {
-                ...member.info,
-                memberCollective: memberCollective.activity,
-              },
-              order: order && {
-                ...order.activity,
-                tier: order.Tier && order.Tier.minimal,
-                subscription: {
-                  interval: order.Subscription && order.Subscription.interval,
-                },
-              },
-            };
-            return models.Activity.create(
-              {
-                CollectiveId: this.id,
-                type: activities.COLLECTIVE_MEMBER_CREATED,
-                data,
-              },
-              sequelizeParams,
-            );
-          });
+    return models.Activity.create(
+      { CollectiveId: this.id, type: activities.COLLECTIVE_MEMBER_CREATED, data },
+      sequelizeParams,
+    );
+  };
 
-        case roles.MEMBER:
-        case roles.ADMIN:
-          // We don't notify if the new member is the logged in user
-          if (get(remoteUser, 'collective.id') === get(memberUser, 'collective.id')) {
-            return member;
-          }
-          // We only send the notification for new member for role MEMBER and ADMIN
-          return emailLib.send(
-            `${this.type}.newmember`.toLowerCase(),
-            memberUser.email,
-            {
-              remoteUser: {
-                email: remoteUser.email,
-                collective: pick(remoteUser.collective, ['slug', 'name', 'image']),
-              },
-              role: role.toLowerCase(),
-              isAdmin: role === roles.ADMIN,
-              collective: {
-                slug: this.slug,
-                name: this.name,
-                type: this.type.toLowerCase(),
-              },
-              recipient: {
-                collective: memberUser.collective.activity,
-              },
-              loginLink: `${config.host.website}/signin?next=/${memberUser.collective.slug}/edit`,
-            },
-            { cc: remoteUser.email },
-          );
-        default:
-          return member;
-      }
-    });
+  Collective.prototype.sendNewMemberEmail = async function(user, role, member, sequelizeParams) {
+    const remoteUser = await models.User.findByPk(
+      member.CreatedByUserId,
+      { include: [{ model: models.Collective, as: 'collective' }] },
+      sequelizeParams,
+    );
+
+    const memberUser = await models.User.findByPk(
+      user.id,
+      { include: [{ model: models.Collective, as: 'collective' }] },
+      sequelizeParams,
+    );
+
+    // We don't notify if the new member is the logged in user
+    if (get(remoteUser, 'collective.id') === get(memberUser, 'collective.id')) {
+      return;
+    }
+
+    // We only send the notification for new member for role MEMBER and ADMIN
+    return emailLib.send(
+      `${this.type}.newmember`.toLowerCase(),
+      memberUser.email,
+      {
+        remoteUser: {
+          email: remoteUser.email,
+          collective: pick(remoteUser.collective, ['slug', 'name', 'image']),
+        },
+        role: role.toLowerCase(),
+        isAdmin: role === roles.ADMIN,
+        collective: {
+          slug: this.slug,
+          name: this.name,
+          type: this.type.toLowerCase(),
+        },
+        recipient: {
+          collective: memberUser.collective.activity,
+        },
+        loginLink: `${config.host.website}/signin?next=/${memberUser.collective.slug}/edit`,
+      },
+      { cc: remoteUser.email },
+    );
   };
 
   // Used when creating a transactin to add a user to the collective as a backer if needed
-  Collective.prototype.findOrAddUserWithRole = function(user, role, defaultAttributes) {
+  Collective.prototype.findOrAddUserWithRole = function(user, role, defaultAttributes, context, transaction) {
     return models.Member.findOne({
       where: {
         role,
-        CreatedByUserId: user.id,
         MemberCollectiveId: user.CollectiveId,
         CollectiveId: this.id,
       },
     }).then(Member => {
       if (!Member) {
-        return this.addUserWithRole(user, role, defaultAttributes);
+        return this.addUserWithRole(user, role, defaultAttributes, context, transaction);
       } else {
         return Member;
       }
@@ -1424,8 +1429,6 @@ export default function(Sequelize, DataTypes) {
       throw new Error(`This collective already has a host (HostCollectiveId: ${this.HostCollectiveId})`);
     }
 
-    creatorUser = creatorUser || { id: hostCollective.CreatedByUserId };
-
     const member = {
       role: roles.HOST,
       CreatedByUserId: creatorUser ? creatorUser.id : hostCollective.CreatedByUserId,
@@ -1433,22 +1436,31 @@ export default function(Sequelize, DataTypes) {
       CollectiveId: this.id,
     };
 
-    let isActive = false;
-    let approvedAt = null;
-    if (creatorUser.isAdmin) {
-      if (this.ParentCollectiveId && creatorUser.isAdmin(this.ParentCollectiveId)) {
-        isActive = true;
-        approvedAt = new Date();
-      } else if (creatorUser.isAdmin(hostCollective.id)) {
-        isActive = true;
-        approvedAt = new Date();
+    let shouldAutomaticallyApprove = options && options.shouldAutomaticallyApprove;
+
+    // If not forced, let's check for cases where we can still safely automatically approve collective
+    if (!shouldAutomaticallyApprove) {
+      if (creatorUser.isAdmin(hostCollective.id)) {
+        // If user is admin of the host, we can automatically approve
+        shouldAutomaticallyApprove = true;
+      } else if (this.ParentCollectiveId && creatorUser.isAdmin(this.ParentCollectiveId)) {
+        // If there's a parent collective already approved by the host and user is admin of it, we can also approve
+        const parentCollective = await models.Collective.findByPk(this.ParentCollectiveId);
+        if (parentCollective && parentCollective.HostCollectiveId === hostCollective.id && parentCollective.isActive) {
+          shouldAutomaticallyApprove = true;
+        }
       }
     }
+
+    // If we can't automatically approve the collective and it is not open to new applications, reject it
+    if (!shouldAutomaticallyApprove && !hostCollective.canApply()) {
+      throw new Error('This host is not open to applications');
+    }
+
     const updatedValues = {
       HostCollectiveId: hostCollective.id,
       hostFeePercent: hostCollective.hostFeePercent,
-      isActive,
-      approvedAt,
+      ...(shouldAutomaticallyApprove ? { isActive: true, approvedAt: new Date() } : null),
     };
 
     // events should take the currency of their parent collective, not necessarily the host of their host.
@@ -1641,7 +1653,26 @@ export default function(Sequelize, DataTypes) {
             };
 
             member.CollectiveId = this.id;
-            if (member.CreatedByUserId) {
+            if (member.member && member.member.id) {
+              // Add member from collective ID. Ignore incognito profiles.
+              return models.User.findOne({
+                where: { CollectiveId: member.member.id },
+                include: {
+                  model: models.Collective,
+                  as: 'collective',
+                  attributes: ['id'],
+                  where: { type: types.USER, isIncognito: false },
+                },
+              }).then(user => {
+                if (!user) {
+                  logger.error('[Edit Members] No user found for member', member);
+                  throw new Error(`No profile found for ${member.member.name}. Please contact support`);
+                } else {
+                  return this.addUserWithRole(user, member.role, { TierId: member.TierId, ...memberAttrs });
+                }
+              });
+            } else if (member.CreatedByUserId) {
+              // @deprecated since 2019-10-21 this path doesn't seems to be used anymore
               const user = {
                 id: member.CreatedByUserId,
                 CollectiveId: member.MemberCollectiveId,
@@ -1651,6 +1682,7 @@ export default function(Sequelize, DataTypes) {
                 ...memberAttrs,
               });
             } else {
+              // @deprecated since 2019-10-21 we now expect user to create the collective and pass an ID
               return models.User.findOrCreateByEmail(member.member.email, member.member).then(user => {
                 return this.addUserWithRole(user, member.role, {
                   TierId: member.TierId,
@@ -1661,11 +1693,12 @@ export default function(Sequelize, DataTypes) {
           }
         });
       })
-      .then(() =>
-        this.getMembers({
+      .then(() => {
+        invalidateContributorsCache(this.id);
+        return this.getMembers({
           where: { role: { [Op.in]: [roles.ADMIN, roles.MEMBER] } },
-        }),
-      );
+        });
+      });
   };
 
   // edit the tiers of this collective (create/update/remove)
@@ -2094,6 +2127,7 @@ export default function(Sequelize, DataTypes) {
           id &&
           models.ConnectedAccount.findOne({
             where: { service: 'stripe', CollectiveId: id },
+            order: [['createdAt', 'DESC']],
           })
         );
       })
@@ -2134,19 +2168,7 @@ export default function(Sequelize, DataTypes) {
   };
 
   Collective.prototype.getImageUrl = function(args = {}) {
-    const sections = [config.host.images, this.slug];
-
-    if (this.image) {
-      sections.push(md5(this.image).substring(0, 7));
-    }
-
-    sections.push(this.type === 'USER' ? 'avatar' : 'logo');
-
-    if (args.height) {
-      sections.push(args.height);
-    }
-
-    return `${sections.join('/')}.${args.format || 'png'}`;
+    return getCollectiveAvatarUrl(this.slug, this.type, this.image, args);
   };
 
   Collective.prototype.getBackgroundImageUrl = function(args = {}) {
@@ -2296,7 +2318,7 @@ export default function(Sequelize, DataTypes) {
       .then(slugList => slugSuggestionHelper(suggestions[0], slugList, 0));
   };
 
-  Collective.findBySlug = (slug, options = {}) => {
+  Collective.findBySlug = (slug, options = {}, throwIfMissing = true) => {
     if (!slug || slug.length < 1) {
       return Promise.resolve(null);
     }
@@ -2304,7 +2326,7 @@ export default function(Sequelize, DataTypes) {
       where: { slug: slug.toLowerCase() },
       ...options,
     }).then(collective => {
-      if (!collective) {
+      if (!collective && throwIfMissing) {
         throw new Error(`No collective found with slug ${slug}`);
       }
       return collective;
@@ -2400,7 +2422,7 @@ export default function(Sequelize, DataTypes) {
     Collective.belongsTo(m.Collective, { as: 'HostCollective' });
   };
 
-  Historical(Collective, Sequelize);
+  Temporal(Collective, Sequelize);
 
   return Collective;
 }

@@ -1,12 +1,14 @@
 import Promise from 'bluebird';
-import { find, get, uniq, pick } from 'lodash';
+import { get, uniq, pick } from 'lodash';
 import { GraphQLList, GraphQLNonNull, GraphQLString, GraphQLInt, GraphQLBoolean } from 'graphql';
+import { isEmail } from 'validator';
 
-import algolia from '../../lib/algolia';
 import errors from '../../lib/errors';
 import rawQueries from '../../lib/queries';
+import { types as CollectiveTypes } from '../../constants/collectives';
 import models, { sequelize, Op } from '../../models';
 import { fetchCollectiveId } from '../../lib/cache';
+import { searchCollectivesByEmail, searchCollectivesOnAlgolia, searchCollectivesInDB } from '../../lib/search';
 
 import {
   CollectiveInterfaceType,
@@ -48,17 +50,22 @@ const queries = {
     args: {
       slug: { type: GraphQLString },
       id: { type: GraphQLInt },
+      throwIfMissing: {
+        type: GraphQLBoolean,
+        defaultValue: true,
+        description: 'If false, will return null instead of an error if collective is not found',
+      },
     },
     resolve(_, args) {
       let collective;
       if (args.slug) {
-        collective = models.Collective.findBySlug(args.slug.toLowerCase());
+        collective = models.Collective.findBySlug(args.slug.toLowerCase(), null, args.throwIfMissing);
       } else if (args.id) {
         collective = models.Collective.findByPk(args.id);
       } else {
         return new Error('Please provide a slug or an id');
       }
-      if (!collective) {
+      if (!collective && args.throwIfMissing) {
         throw new errors.NotFound('Collective not found');
       }
       return collective;
@@ -640,7 +647,7 @@ const queries = {
       if (args.category) query.where.category = { [Op.iLike]: args.category };
       if (args.limit) query.limit = args.limit;
       if (args.offset) query.offset = args.offset;
-      query.order = [['incurredAt', 'DESC']];
+      query.order = [['createdAt', 'DESC']];
       return req.loaders.collective.findById.load(args.CollectiveId).then(collective => {
         if (!collective) {
           throw new Error('Collective not found');
@@ -886,21 +893,37 @@ const queries = {
       }
 
       if (args.orderBy === 'totalDonations') {
-        query.attributes = {
-          include: [
-            [
-              sequelize.literal(`(
-                SELECT  COALESCE(SUM("netAmountInCollectiveCurrency"), 0) 
-                FROM    "Transactions" t 
-                WHERE   t."type" = 'CREDIT' 
-                AND     t."CollectiveId" = "Collective".id
-              )`),
-              'totalDonations',
+        if (args.isPledged) {
+          query.attributes = {
+            include: [
+              [
+                sequelize.literal(`(
+                  SELECT  COALESCE(SUM("totalAmount"), 0)
+                  FROM    "Orders" o, "Collectives" c
+                  WHERE   c."isPledged" IS TRUE
+                  AND     o."CollectiveId" = "Collective".id
+                )`),
+                'totalDonations',
+              ],
             ],
-          ],
-        };
-
-        query.order = [[sequelize.col('totalDonations'), args.orderDirection]];
+          };
+          query.order = [[sequelize.col('totalDonations'), args.orderDirection]];
+        } else {
+          query.attributes = {
+            include: [
+              [
+                sequelize.literal(`(
+                  SELECT  COALESCE(SUM("netAmountInCollectiveCurrency"), 0)
+                  FROM    "Transactions" t
+                  WHERE   t."type" = 'CREDIT'
+                  AND     t."CollectiveId" = "Collective".id
+                )`),
+                'totalDonations',
+              ],
+            ],
+          };
+          query.order = [[sequelize.col('totalDonations'), args.orderDirection]];
+        }
       } else {
         query.order = [[args.orderBy, args.orderDirection]];
       }
@@ -967,12 +990,20 @@ const queries = {
         defaultValue: 0,
         type: GraphQLInt,
       },
+      onlyOpenHosts: {
+        type: GraphQLBoolean,
+        defaultValue: true,
+      },
+      minNbCollectivesHosted: {
+        type: new GraphQLNonNull(GraphQLInt),
+        defaultValue: 0,
+      },
     },
     async resolve(_, args) {
-      const results = await rawQueries.getPublicHostsByTotalCollectives(args);
+      const { collectives, total } = await rawQueries.getHosts(args);
       return {
-        total: results.length,
-        collectives: results,
+        total,
+        collectives,
         limit: args.limit,
         offset: args.offset,
       };
@@ -1251,11 +1282,23 @@ const queries = {
    */
   search: {
     type: CollectiveSearchResultsType,
+    description: `
+      Search for collectives. Uses Algolia, except if searching for users or if using flag to opt-out.
+      Results are returned with best matches first.
+    `,
     args: {
       term: {
         type: GraphQLString,
         description:
           'Fetch collectives related to this term based on name, description, tags, slug, mission, and location',
+      },
+      hostCollectiveIds: {
+        type: new GraphQLList(GraphQLInt),
+        description: '[NON AVAILABLE WITH ALGOLIA] Limit the search to collectives under these hosts',
+      },
+      types: {
+        type: new GraphQLList(TypeOfCollectiveType),
+        description: 'Only return collectives of this type',
       },
       limit: {
         type: GraphQLInt,
@@ -1266,46 +1309,47 @@ const queries = {
         type: GraphQLInt,
         defaultValue: 0,
       },
+      useAlgolia: {
+        type: GraphQLBoolean,
+        defaultValue: true,
+        description: `
+          If set to false, an internal query will be used to search the collective rather than Algolia. 
+          You **must** set this to false when searching for users/organizations.
+        `,
+      },
     },
-    async resolve(_, args) {
-      const { limit, offset, term } = args;
-
-      if (term.trim() === '') {
+    async resolve(_, args, req) {
+      const { limit, offset, term, types, hostCollectiveIds, useAlgolia } = args;
+      const cleanTerm = term ? term.trim() : '';
+      const isEmptyTerm = cleanTerm.length === 0;
+      const listToStr = list => (list ? list.join('_') : '');
+      const generateResults = (collectives, total) => {
+        const optionalParamsKey = `${listToStr(types)}-${listToStr(hostCollectiveIds)}`;
         return {
-          collectives: [],
+          id: `search-${optionalParamsKey}-${cleanTerm}-${offset}-${limit}-${useAlgolia ? 'algolia' : 'direct'}`,
+          total,
+          collectives,
           limit,
           offset,
-          total: 0,
         };
-      }
-
-      const index = algolia.getIndex();
-      if (!index) {
-        return { collectives: [], limit, offset, total: 0 };
-      }
-
-      const { hits, nbHits: total } = await index.search({
-        query: term,
-        length: limit,
-        offset,
-      });
-      const collectiveIds = hits.map(({ id }) => id);
-      const collectives = await models.Collective.findAll({
-        where: {
-          id: {
-            [Op.in]: collectiveIds,
-          },
-        },
-      });
-
-      // map over the collectiveIds with the database results to keep the original order from Algolia
-      // filter out null results
-      return {
-        collectives: collectiveIds.map(id => find(collectives, { id })).filter(Boolean),
-        limit,
-        offset,
-        total,
       };
+
+      if (useAlgolia) {
+        if (isEmptyTerm) {
+          return generateResults([], 0);
+        } else {
+          const [collectives, total] = await searchCollectivesOnAlgolia(cleanTerm, offset, limit, types);
+          return generateResults(collectives, total);
+        }
+      } else if (isEmail(cleanTerm) && req.remoteUser && (!types || types.includes(CollectiveTypes.USER))) {
+        // If an email is provided, search in the user table. Users must be authenticated
+        // because we limit the rate of queries for this feature.
+        const [collectives, total] = await searchCollectivesByEmail(cleanTerm, req.remoteUser);
+        return generateResults(collectives, total);
+      } else {
+        const [collectives, total] = await searchCollectivesInDB(cleanTerm, offset, limit, types, hostCollectiveIds);
+        return generateResults(collectives, total);
+      }
     },
   },
   /** Gets the transactions of a payment method

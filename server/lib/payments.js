@@ -89,8 +89,16 @@ export async function processOrder(order, options) {
  *  associated to the refund transaction as who performed the refund.
  */
 export async function refundTransaction(transaction, user) {
-  const paymentMethod = findPaymentMethodProvider(transaction.PaymentMethod);
-  return await paymentMethod.refundTransaction(transaction, user);
+  // If no payment method was used, it means that we're using a manual payment method
+  const paymentMethodProvider = transaction.PaymentMethod
+    ? findPaymentMethodProvider(transaction.PaymentMethod)
+    : paymentProviders.opencollective.types.manual;
+
+  if (!paymentMethodProvider.refundTransaction) {
+    throw new Error('This payment method provider does not support refunds');
+  }
+
+  return await paymentMethodProvider.refundTransaction(transaction, user);
 }
 
 /** Calculates how much an amount's fee is worth.
@@ -224,13 +232,6 @@ export const sendEmailNotifications = (order, transaction) => {
   }
 };
 
-export const addBackerToCollective = async (user, collective, TierId) => {
-  return await collective.findOrAddUserWithRole(user, roles.BACKER, {
-    CreatedByUserId: user.id,
-    TierId,
-  });
-};
-
 export const createSubscription = async order => {
   const subscription = await models.Subscription.create({
     amount: order.totalAmount,
@@ -306,22 +307,22 @@ export const executeOrder = async (user, order, options) => {
   }
 
   // Register user as collective backer
-  await addBackerToCollective(
+  await order.collective.findOrAddUserWithRole(
     { id: user.id, CollectiveId: order.FromCollectiveId },
-    order.collective,
-    get(order, 'tier.id'),
+    roles.BACKER,
+    { TierId: get(order, 'tier.id') },
+    { order },
   );
+
   sendEmailNotifications(order, transaction);
 
   // Register VirtualCard emitter as collective backer too
   if (transaction && transaction.UsingVirtualCardFromCollectiveId) {
-    addBackerToCollective(
-      {
-        id: user.id,
-        CollectiveId: transaction.UsingVirtualCardFromCollectiveId,
-      },
-      order.collective,
-      get(order, 'tier.id'),
+    await order.collective.findOrAddUserWithRole(
+      { id: user.id, CollectiveId: transaction.UsingVirtualCardFromCollectiveId },
+      roles.BACKER,
+      { TierId: get(order, 'tier.id') },
+      { order, skipActivity: true },
     );
   }
 

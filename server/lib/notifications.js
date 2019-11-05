@@ -212,7 +212,11 @@ async function notifyByEmail(activity) {
       break;
 
     case activityType.COLLECTIVE_EXPENSE_CREATED:
-      notifyAdminsOfCollective(activity.data.collective.id, activity);
+      notifyAdminsOfCollective(activity.CollectiveId, activity);
+      break;
+
+    case activityType.COLLECTIVE_CONTACT:
+      notifyAdminsOfCollective(activity.data.collective.id, activity, { replyTo: activity.data.user.email });
       break;
 
     case activityType.COLLECTIVE_COMMENT_CREATED:
@@ -286,9 +290,21 @@ async function notifyByEmail(activity) {
       notifyAdminsOfCollective(activity.data.collective.id, activity);
       break;
 
+    case activityType.COLLECTIVE_REJECTED:
+      notifyAdminsOfCollective(
+        activity.data.collective.id,
+        activity,
+        {
+          template: 'collective.rejected',
+        },
+        { replyTo: `hello@${activity.data.host.slug}.opencollective.com` },
+      );
+      break;
+
     case activityType.COLLECTIVE_APPLY:
       notifyAdminsOfCollective(activity.data.host.id, activity, {
         template: 'collective.apply.for.host',
+        replyTo: activity.data.user.email,
       });
       notifyAdminsOfCollective(activity.data.collective.id, activity, {
         from: `hello@${activity.data.host.slug}.opencollective.com`,
@@ -310,5 +326,14 @@ async function notifyByEmail(activity) {
         template: 'collective.created.opensource',
       });
       break;
+
+    case activityType.BACKYOURSTACK_DISPATCH_CONFIRMED:
+      for (const order of activity.data.orders) {
+        order.collective = await models.Collective.findByPk(order.CollectiveId);
+      }
+
+      notifyAdminsOfCollective(activity.data.collective.id, activity, {
+        template: 'backyourstack.dispatch.confirmed',
+      });
   }
 }

@@ -65,7 +65,21 @@ export function strip_tags(str, allowedTags) {
     allowedAttributes: {
       a: ['href', 'name', 'target'],
       img: ['src'],
+      iframe: [
+        'src',
+        'allowfullscreen',
+        'frameborder',
+        'autoplay',
+        'width',
+        'height',
+        {
+          name: 'allow',
+          multiple: true,
+          values: ['autoplay', 'encrypted-media', 'gyroscope'],
+        },
+      ],
     },
+    allowedIframeHostnames: ['www.youtube.com', 'www.youtube-nocookie.com', 'player.vimeo.com'],
   });
 }
 
@@ -540,3 +554,19 @@ export const md5 = value =>
     .createHash('md5')
     .update(value)
     .digest('hex');
+
+/**
+ * Filter `list` with `filterFunc` until `conditionFunc` returns true.
+ */
+export const filterUntil = (list, filterFunc, conditionFunc) => {
+  const result = [];
+  for (let i = 0; i < list.length; i++) {
+    if (filterFunc(list[i])) {
+      result.push(list[i]);
+      if (conditionFunc(result)) {
+        return result;
+      }
+    }
+  }
+  return result;
+};

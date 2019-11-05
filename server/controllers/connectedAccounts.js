@@ -6,6 +6,7 @@ import models, { Op } from '../models';
 import errors from '../lib/errors';
 import paymentProviders from '../paymentProviders';
 import * as github from '../lib/github';
+import { mustBeLoggedInTo } from '../lib/auth';
 
 const { ConnectedAccount, User } = models;
 
@@ -131,6 +132,40 @@ export const createOrUpdate = (req, res, next, accessToken, data, emails) => {
   }
 };
 
+export const disconnect = async (req, res) => {
+  const { collectiveId: CollectiveId, service } = req.params;
+  const { remoteUser } = req;
+
+  try {
+    mustBeLoggedInTo(remoteUser, 'disconnect this connected account');
+
+    if (!remoteUser.isAdmin(CollectiveId)) {
+      throw new errors.Unauthorized({
+        message: 'You are either logged out or not authorized to disconnect this account',
+      });
+    }
+
+    const account = await ConnectedAccount.findOne({
+      where: { service, CollectiveId },
+    });
+
+    if (account) {
+      await account.destroy();
+    }
+
+    res.send({
+      deleted: true,
+      service,
+    });
+  } catch (err) {
+    res.send({
+      error: {
+        message: err.message,
+      },
+    });
+  }
+};
+
 export const verify = (req, res, next) => {
   const payload = req.jwtPayload;
   const service = req.params.service;
@@ -162,9 +197,13 @@ const getGithubAccount = async req => {
   return githubAccount;
 };
 
+// Use a 1 minutes timeout as the default 25 seconds can leads to failing requests.
+const GITHUB_REPOS_FETCH_TIMEOUT = 1 * 60 * 1000;
+
 export const fetchAllRepositories = async (req, res, next) => {
   const githubAccount = await getGithubAccount(req);
   try {
+    req.setTimeout(GITHUB_REPOS_FETCH_TIMEOUT);
     let repos = await github.getAllUserPublicRepos(githubAccount.token);
     if (repos.length !== 0) {
       repos = repos.filter(repo => {

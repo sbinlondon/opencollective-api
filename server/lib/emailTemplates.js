@@ -17,9 +17,11 @@ export const templateNames = [
   'collective.apply',
   'collective.apply.for.host',
   'collective.approved',
+  'collective.rejected',
   'collective.comment.created',
   'collective.confirm',
   'collective.created',
+  'collective.contact',
   'collective.created.meetup',
   'collective.created.opensource',
   'collective.expense.approved',
@@ -90,6 +92,7 @@ export const templateNames = [
   'user.new.token.text',
   'user.yearlyreport',
   'user.yearlyreport.text',
+  'backyourstack.dispatch.confirmed',
 ];
 
 const templatesPath = `${__dirname}/../../templates`;

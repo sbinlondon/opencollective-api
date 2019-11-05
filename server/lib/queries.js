@@ -3,7 +3,7 @@ import config from 'config';
 import { get, pick } from 'lodash';
 
 import { memoize } from './cache';
-import currencies from '../constants/currencies';
+import { convertToCurrency } from './currency';
 import models, { sequelize, Op } from '../models';
 
 const twoHoursInSeconds = 2 * 60 * 60;
@@ -11,7 +11,7 @@ const twoHoursInSeconds = 2 * 60 * 60;
 /*
  * Hacky way to do currency conversion
  */
-const generateFXConversionSQL = aggregate => {
+const generateFXConversionSQL = async aggregate => {
   let currencyColumn = 't.currency';
   let amountColumn = 't."netAmountInCollectiveCurrency"';
 
@@ -20,45 +20,52 @@ const generateFXConversionSQL = aggregate => {
     amountColumn = 'SUM("t."netAmountInCollectiveCurrency"")';
   }
 
-  const fxConversion = [];
-  for (const currency in currencies) {
-    fxConversion.push([currency, currencies[currency].fxrate]);
-  }
-
-  let sql = 'CASE ';
-  sql += fxConversion
-    .map(currency => `WHEN ${currencyColumn} = '${currency[0]}' THEN ${amountColumn} / ${currency[1]}`)
-    .join('\n');
-  sql += 'ELSE 0 END';
-
-  return sql;
+  const amount = await convertToCurrency(1, 'USD', currencyColumn);
+  return currencyColumn ? `${amountColumn} / ${amount}` : '0';
 };
 
-const getPublicHostsByTotalCollectives = args => {
-  let conditions = '';
+const getHosts = async args => {
+  let hostConditions = '';
   if (args.tags && args.tags.length > 0) {
-    conditions = 'AND c.tags && $tags';
+    hostConditions = 'AND c.tags && $tags';
   }
   if (args.currency && args.currency.length === 3) {
-    conditions += ' AND c.currency=$currency';
+    hostConditions += ' AND c.currency=$currency';
   }
+  if (args.onlyOpenHosts) {
+    hostConditions += ` AND c."settings" #>> '{apply}' IS NOT NULL AND (c."settings" #>> '{apply}') != 'false'`;
+  }
+
   const query = `
-  WITH counts AS (
-    SELECT max(c.id) as "HostCollectiveId", count(m.id) as count FROM "Collectives" c
-    LEFT JOIN "Members" m ON m."MemberCollectiveId" = c.id AND m.role = 'HOST' AND m."deletedAt" IS NULL
-    WHERE c."settings" #>> '{apply}' IS NOT NULL
-      ${conditions}
-      AND c."deletedAt" IS NULL
+    WITH all_hosts AS (
+      SELECT max(c.id) as "HostCollectiveId", count(m.id) as count
+      FROM "Collectives" c
+      LEFT JOIN "Members" m ON m."MemberCollectiveId" = c.id AND m.role = 'HOST' AND m."deletedAt" IS NULL
+      WHERE c."deletedAt" IS NULL ${hostConditions}
+      GROUP BY c.id
+      HAVING count(m.id) >= $minNbCollectivesHosted
+    ) SELECT c.*, (SELECT COUNT(*) FROM all_hosts) AS __hosts_count__, SUM(all_hosts.count) as __members_count__
+    FROM "Collectives" c INNER JOIN all_hosts ON all_hosts."HostCollectiveId" = c.id
     GROUP BY c.id
-  )
-  SELECT counts.count as collectives, c.*
-  FROM "Collectives" c INNER JOIN counts ON counts."HostCollectiveId" = c.id
-  ORDER BY ${args.orderBy} ${args.orderDirection} LIMIT ${args.limit} OFFSET ${args.offset}
+    ORDER BY ${args.orderBy === 'collectives' ? '__members_count__' : args.orderBy} ${args.orderDirection}
+    LIMIT $limit
+    OFFSET $offset
   `;
-  return sequelize.query(query, {
-    bind: { tags: args.tags || [], currency: args.currency },
+
+  const result = await sequelize.query(query, {
+    bind: {
+      tags: args.tags || [],
+      currency: args.currency,
+      limit: args.limit,
+      offset: args.offset,
+      minNbCollectivesHosted: args.minNbCollectivesHosted,
+    },
     type: sequelize.QueryTypes.SELECT,
+    model: models.Collective,
+    mapToModel: true,
   });
+
+  return { collectives: result, total: get(result[0], 'dataValues.__hosts_count__', 0) };
 };
 
 const getTotalAnnualBudgetForHost = HostCollectiveId => {
@@ -114,13 +121,15 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
     .then(res => Math.round(parseInt(res[0].yearlyIncome, 10)));
 };
 
-const getTotalAnnualBudget = () => {
+const getTotalAnnualBudget = async () => {
+  const fxConversionSQL = await generateFXConversionSQL();
+
   return sequelize
     .query(
       `
   SELECT
     (SELECT
-      COALESCE(SUM(${generateFXConversionSQL()} * 12),0)
+      COALESCE(SUM(${fxConversionSQL} * 12),0)
       FROM "Subscriptions" s
       LEFT JOIN "Orders" d ON s.id = d."SubscriptionId"
       LEFT JOIN "Transactions" t
@@ -133,7 +142,7 @@ const getTotalAnnualBudget = () => {
         AND s."deletedAt" IS NULL)
     +
     (SELECT
-      COALESCE(SUM(${generateFXConversionSQL()}),0) FROM "Transactions" t
+      COALESCE(SUM(${fxConversionSQL}),0) FROM "Transactions" t
       LEFT JOIN "Orders" d ON t."OrderId" = d.id
       LEFT JOIN "Subscriptions" s ON d."SubscriptionId" = s.id
       WHERE t.type='CREDIT' AND t."CollectiveId" != 1
@@ -142,7 +151,7 @@ const getTotalAnnualBudget = () => {
         AND ((s.interval = 'year' AND s."isActive" IS TRUE AND s."deletedAt" IS NULL) OR s.interval IS NULL))
     +
     (SELECT
-      COALESCE(SUM(${generateFXConversionSQL()}),0) FROM "Transactions" t
+      COALESCE(SUM(${fxConversionSQL}),0) FROM "Transactions" t
       LEFT JOIN "Orders" d on t."OrderId" = d.id
       LEFT JOIN "Subscriptions" s ON d."SubscriptionId" = s.id
       WHERE t.type='CREDIT' AND t."CollectiveId" != 1
@@ -901,7 +910,7 @@ const getCollectivesWithMinBackers = memoize(getCollectivesWithMinBackersQuery, 
 });
 
 const queries = {
-  getPublicHostsByTotalCollectives,
+  getHosts,
   getCollectivesOrderedByMonthlySpending,
   getCollectivesOrderedByMonthlySpendingQuery,
   getTotalDonationsByCollectiveType,

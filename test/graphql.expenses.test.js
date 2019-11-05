@@ -14,7 +14,6 @@ import * as store from './stores';
 /* Support code */
 import models from '../server/models';
 import emailLib from '../server/lib/email';
-import * as libtransactions from '../server/lib/transactions';
 import { getFxRate } from '../server/lib/currency';
 
 import paypalAdaptive from '../server/paymentProviders/paypal/adaptiveGateway';
@@ -62,6 +61,33 @@ const deleteExpenseQuery = `
 const payExpenseQuery = `
   mutation payExpense($id: Int!, $paymentProcessorFeeInCollectiveCurrency: Int, $hostFeeInCollectiveCurrency: Int, $platformFeeInCollectiveCurrency: Int) {
     payExpense(id: $id, paymentProcessorFeeInCollectiveCurrency: $paymentProcessorFeeInCollectiveCurrency, hostFeeInCollectiveCurrency: $hostFeeInCollectiveCurrency, platformFeeInCollectiveCurrency: $platformFeeInCollectiveCurrency) { id status } }`;
+
+const markExpenseAsUnpaidQuery = `
+  mutation markExpenseAsUnpaid($id: Int!, $processorFeeRefunded: Boolean!) {
+    markExpenseAsUnpaid(id: $id, processorFeeRefunded: $processorFeeRefunded) { id status } }`;
+
+const unapproveExpenseQuery = `
+  mutation unapproveExpense($id: Int!) {
+    unapproveExpense(id: $id) { id status } }
+`;
+
+const addFunds = async (user, hostCollective, collective, amount) => {
+  const currency = collective.currency || 'USD';
+  const hostCurrencyFxRate = await getFxRate(currency, hostCollective.currency);
+  const amountInHostCurrency = Math.round(hostCurrencyFxRate * amount);
+  await models.Transaction.create({
+    CreatedByUserId: user.id,
+    HostCollectiveId: hostCollective.id,
+    type: 'CREDIT',
+    amount,
+    amountInHostCurrency,
+    hostCurrencyFxRate,
+    netAmountInCollectiveCurrency: amount,
+    hostCurrency: hostCollective.currency,
+    currency,
+    CollectiveId: collective.id,
+  });
+};
 
 describe('GraphQL Expenses API', () => {
   beforeEach(utils.resetTestDB);
@@ -476,7 +502,7 @@ describe('GraphQL Expenses API', () => {
       expect(emailSendMessageSpy.callCount).to.equal(1);
       expect(emailSendMessageSpy.firstCall.args[0]).to.equal(admin.email);
       expect(emailSendMessageSpy.firstCall.args[1]).to.equal(
-        'New expense on Test Collective: $10 for Test expense for pizza',
+        'New expense on Test Collective: $10.00 for Test expense for pizza',
       );
       expect(emailSendMessageSpy.firstCall.args[2]).to.contain('/test-collective/expenses/1/approve');
 
@@ -607,7 +633,7 @@ describe('GraphQL Expenses API', () => {
       expect(emailSendMessageSpy.firstCall.args[1]).to.contain('Your expense');
       expect(emailSendMessageSpy.firstCall.args[1]).to.contain('has been approved');
       expect(emailSendMessageSpy.secondCall.args[0]).to.equal(hostAdmin.email);
-      expect(emailSendMessageSpy.secondCall.args[1]).to.contain('New expense approved on rollup: $10 for Pizza');
+      expect(emailSendMessageSpy.secondCall.args[1]).to.contain('New expense approved on rollup: $10.00 for Pizza');
       expect(emailSendMessageSpy.secondCall.args[2]).to.contain('PayPal (testuser@paypal.com)');
       expect(emailSendMessageSpy.secondCall.args[2]).to.contain('Private instructions to reimburse this expense');
     }); /* End of "successfully approve expense and send notification email to author of expense" */
@@ -682,24 +708,6 @@ describe('GraphQL Expenses API', () => {
         'Expense needs to be approved. Current status of the expense: REJECTED.',
       );
     }); /* End of "fails if expense is not approved (REJECTED)" */
-
-    const addFunds = async (user, hostCollective, collective, amount) => {
-      const currency = collective.currency || 'USD';
-      const hostCurrencyFxRate = await getFxRate(currency, hostCollective.currency);
-      const amountInHostCurrency = Math.round(hostCurrencyFxRate * amount);
-      await models.Transaction.create({
-        CreatedByUserId: user.id,
-        HostCollectiveId: hostCollective.id,
-        type: 'CREDIT',
-        amount,
-        amountInHostCurrency,
-        hostCurrencyFxRate,
-        netAmountInCollectiveCurrency: amount,
-        hostCurrency: hostCollective.currency,
-        currency,
-        CollectiveId: collective.id,
-      });
-    };
 
     it('fails if not enough funds', async () => {
       // Given that we have a host and a collective
@@ -852,7 +860,7 @@ describe('GraphQL Expenses API', () => {
     });
 
     describe('success', () => {
-      let hostAdmin, hostCollective, collective, expense, user, userCollective;
+      let hostAdmin, hostCollective, collective, expense, user;
 
       beforeEach(async () => {
         // Given that we have a host and a collective
@@ -864,7 +872,7 @@ describe('GraphQL Expenses API', () => {
         ));
 
         // And given a user to file expenses
-        ({ user, userCollective } = await store.newUser('someone cool', {
+        ({ user } = await store.newUser('someone cool', {
           paypalEmail: 'paypal@user.com',
         }));
 
@@ -949,36 +957,6 @@ describe('GraphQL Expenses API', () => {
         expect(emailSendMessageSpy.args[3][0]).to.equal(hostAdmin.email);
         expect(emailSendMessageSpy.args[3][1]).to.contain('Expense paid on WWCode Berlin');
       }); /* End of "pays the expense manually and reduces the balance of the collective" */
-
-      it('Pay expense in kind', async () => {
-        // And the expense will be paid in kind
-        expense.payoutMethod = 'donation';
-        await expense.save();
-        // When the expense is paid by the host admin
-        const parameters = {
-          id: expense.id,
-          paymentProcessorFeeInCollectiveCurrency: 0,
-        };
-        const result = await utils.graphqlQuery(payExpenseQuery, parameters, hostAdmin);
-        result.errors && console.log(result.errors);
-        // Then the collective's balance should stay 0
-        expect(await collective.getBalance()).to.equal(0);
-        // And then it should create a transaction for the user
-        expect(
-          await libtransactions.sum({
-            FromCollectiveId: userCollective.id,
-            CollectiveId: collective.id,
-            currency: 'EUR',
-            type: 'CREDIT',
-          }),
-        ).to.equal(expense.amount);
-        // And then the user should become a backer of the project
-        const membership = await models.Member.findOne({
-          where: { CollectiveId: collective.id, role: 'BACKER' },
-        });
-        expect(membership).to.exist;
-        expect(membership.MemberCollectiveId).to.equal(user.CollectiveId);
-      });
 
       it('Mark expense as paid if expense paypal is the same as host paypal', async () => {
         emailSendMessageSpy.resetHistory();
@@ -1090,9 +1068,7 @@ describe('GraphQL Expenses API', () => {
         ...data,
       });
       // And a backer user
-      const backer = await models.User.createUserWithCollective({
-        name: 'test backer user',
-      });
+      const backer = await models.User.createUserWithCollective({ email: store.randEmail(), name: 'test backer user' });
       await models.Member.create({
         CollectiveId: collective.id,
         MemberCollectiveId: backer.CollectiveId,
@@ -1186,4 +1162,107 @@ describe('GraphQL Expenses API', () => {
       expect(await models.Expense.findByPk(expense.id)).to.be.null;
     }); /* End of "works if logged in as admin of host collective" */
   }); /* End of "#deleteExpense" */
+
+  describe('#markExpenseAsUnpaid', () => {
+    it('successfully mark expense as unpaid', async () => {
+      // Given that we have a host and a collective
+      const { hostAdmin, hostCollective, collective } = await store.newCollectiveWithHost(
+        'railsgirlsatl',
+        'USD',
+        'USD',
+        10,
+      );
+
+      // And given a user to file expenses
+      const { user } = await store.newUser('someone cool');
+      // And given the above collective has one expense (in PENDING
+      // state)
+      const expenseAmount = 1500;
+      const expense = await store.createExpense(user, {
+        amount: expenseAmount,
+        description: 'Pizza',
+        currency: 'USD',
+        payoutMethod: 'other',
+        status: 'PENDING',
+        collective: { id: collective.id },
+      });
+      // And given the expense is approved
+      expense.status = 'APPROVED';
+      await expense.save();
+      // Add then add funds to collective
+      const initialBalance = 1500;
+
+      await addFunds(user, hostCollective, collective, initialBalance);
+      let balance = await collective.getBalance();
+      // Confirm the fund was added
+      expect(balance).to.equal(1500);
+      // Then expense is paid by host admin
+      const res = await utils.graphqlQuery(
+        payExpenseQuery,
+        {
+          id: expense.id,
+          paymentProcessorFeeInHostCurrency: 0,
+        },
+        hostAdmin,
+      );
+      res.errors && console.log(res.errors);
+      expect(res.errors).to.not.exist;
+      expect(res.data.payExpense.status).to.equal('PAID');
+      // checks that the amountExpense was removed from initalBalance
+      balance = await collective.getBalance();
+      expect(balance).to.equal(initialBalance - expenseAmount);
+      // Then mark the expense as unpaid
+      const result = await utils.graphqlQuery(
+        markExpenseAsUnpaidQuery,
+        {
+          id: expense.id,
+          processorFeeRefunded: false,
+        },
+        hostAdmin,
+      );
+      result.errors && console.log(result.errors);
+      expect(result.errors).to.not.exist;
+      // The expense you should be back to APPROVED status
+      expect(result.data.markExpenseAsUnpaid.status).to.equal('APPROVED');
+      balance = await collective.getBalance();
+      // The balance should restored baack to initalBalance
+      expect(balance).to.equal(initialBalance);
+    }); /* End of "successfully mark expense as unpaid" */
+  }); /* #markExpenseAsUnpaid */
+  describe('#unapproveExpense', () => {
+    it('successfully unapprove expense', async () => {
+      // Given that we have a collective
+      const { hostAdmin, collective } = await store.newCollectiveWithHost('rollup', 'USD', 'USD', 10);
+      // And given a user that will file an expense
+      const { user } = await store.newUser('an internet user', {
+        paypalEmail: 'testuser@paypal.com',
+      });
+      // And given the above collective has one expense (created by
+      // the above user)
+      const data = {
+        currency: 'USD',
+        payoutMethod: 'paypal',
+        privateMessage: 'Private instructions to reimburse this expense',
+        collective: { id: collective.id },
+      };
+      const expense = await store.createExpense(user, {
+        amount: 1000,
+        description: 'Pizza',
+        ...data,
+      });
+      // approve the expense
+      const res = await utils.graphqlQuery(approveExpenseQuery, { id: expense.id }, hostAdmin);
+      res.errors && console.log(res.errors);
+      expect(res.errors).to.not.exist;
+      // expect expense to be first approved
+      expect(res.data.approveExpense.status).to.equal('APPROVED');
+      // When the expense is approved by the admin of host
+      const result = await utils.graphqlQuery(unapproveExpenseQuery, { id: expense.id }, hostAdmin);
+      result.errors && console.log(result.errors);
+      // Then there should be no errors in the result
+      expect(result.errors).to.not.exist;
+      // And then the approved expense should be set as PENDING
+      expect(result.data.unapproveExpense.status).to.equal('PENDING');
+    }); /* End of "successfully unapprove expense" */
+  }); /* End of #unapproveExpense */
 }); /* End of "GraphQL Expenses API" */

@@ -8,6 +8,7 @@ export default {
   COLLECTIVE_CREATED_GITHUB: 'collective.created.github',
   COLLECTIVE_APPLY: 'collective.apply',
   COLLECTIVE_APPROVED: 'collective.approved',
+  COLLECTIVE_REJECTED: 'collective.rejected',
   COLLECTIVE_CREATED: 'collective.created',
   COLLECTIVE_COMMENT_CREATED: 'collective.comment.created',
   COLLECTIVE_EXPENSE_CREATED: 'collective.expense.created',
@@ -21,6 +22,7 @@ export default {
   COLLECTIVE_UPDATE_CREATED: 'collective.update.created',
   COLLECTIVE_UPDATE_PUBLISHED: 'collective.update.published',
   COLLECTIVE_USER_ADDED: 'collective.user.added',
+  COLLECTIVE_CONTACT: 'collective.contact',
   ORGANIZATION_COLLECTIVE_CREATED: 'organization.collective.created',
   SUBSCRIPTION_CONFIRMED: 'subscription.confirmed',
   SUBSCRIPTION_CANCELED: 'subscription.canceled',
@@ -30,6 +32,7 @@ export default {
   WEBHOOK_PAYPAL_RECEIVED: 'webhook.paypal.received',
   COLLECTIVE_MONTHLY: 'collective.monthly',
   ORDERS_SUSPICIOUS: 'orders.suspicious',
+  BACKYOURSTACK_DISPATCH_CONFIRMED: 'backyourstack.dispatch.confirmed',
 
   // Not used anymore, leaving for historical reference
   COLLECTIVE_TRANSACTION_PAID: 'collective.transaction.paid', // replaced with COLLECTIVE_EXPENSE_PAID

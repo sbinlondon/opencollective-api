@@ -15,7 +15,7 @@ If you see a step below that could be improved (or is outdated), please update t
 
 1. Make sure you have Node.js version >= 10.
 
-- We recommend using [nvm](https://github.com/creationix/nvm): `nvm install`.
+- We recommend using [nvm](https://github.com/creationix/nvm): `nvm use`.
 
 2. Make sure you have a PostgreSQL database available
 
@@ -42,6 +42,9 @@ npm install
 ```
 npm run dev
 ```
+
+- API is started on http://localhost:3060
+- A local email inbox is started on http://localhost:1080
 
 #### Troubleshooting
 

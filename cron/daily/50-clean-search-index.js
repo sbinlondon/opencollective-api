@@ -38,9 +38,18 @@ const done = error => {
 const cleanIndex = async () => {
   const collectives = await models.Collective.findAll({
     where: {
-      deletedAt: {
-        [Op.gt]: yesterday,
-      },
+      [Op.or]: [
+        {
+          deletedAt: {
+            [Op.gt]: yesterday,
+          },
+        },
+        {
+          deactivatedAt: {
+            [Op.gt]: yesterday,
+          },
+        },
+      ],
       type: {
         [Op.or]: [collectiveTypes.COLLECTIVE, collectiveTypes.ORGANIZATION],
       },

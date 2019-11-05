@@ -1,11 +1,18 @@
 import { expect } from 'chai';
 import { describe, it } from 'mocha';
+import sinon from 'sinon';
 
 import models from '../server/models';
+import cache from '../server/lib/cache';
 import * as expenses from '../server/graphql/v1/mutations/expenses';
 
 import * as utils from './utils';
 import * as store from './stores';
+
+function expectNotErrorsFromResult(res) {
+  res.errors && console.error(res.errors);
+  expect(res.errors).to.not.exist;
+}
 
 describe('graphql.collective.test.js', () => {
   beforeEach(async () => {
@@ -21,6 +28,17 @@ describe('graphql.collective.test.js', () => {
     // Than we're supposed to see some errors
     expect(result.errors).to.exist;
     expect(result.errors[0].message).to.equal('No collective found with slug apex');
+  });
+
+  it("won't generate an error if told not to", async () => {
+    // Given the following query
+    const query = `query Collective($slug: String) {
+      Collective(slug: $slug, throwIfMissing: false) { id slug } }`;
+    // When a collective that doesn't exist is retrieved
+    const result = await utils.graphqlQuery(query, { slug: 'apex' });
+    // Than we're supposed to see some errors
+    expect(result.errors).to.not.exist;
+    expect(result.data.Collective).to.be.null;
   });
 
   it('gets the collective info for the collective page', async () => {
@@ -802,18 +820,20 @@ describe('graphql.collective.test.js', () => {
       expect(res.errors).to.not.exist;
       const members = res.data.editCollective.members;
       expect(members.length).to.equal(4);
-      expect(members[2].role).to.equal('MEMBER');
-      expect(members[2].member.name).to.equal('member1');
-      expect(members[2].member.email).to.equal('member1@hail.com');
+      const member1 = members.find(m => m.member.name === 'member1');
+      expect(member1.role).to.equal('MEMBER');
+      expect(member1.member.name).to.equal('member1');
+      expect(member1.member.email).to.equal('member1@hail.com');
 
-      const member = await models.User.findByPk(members[2].member.createdByUser.id);
+      const member = await models.User.findByPk(member1.member.createdByUser.id);
       const res2 = await utils.graphqlQuery(query, { collective }, member);
       expect(res2.errors).to.exist;
       expect(res2.errors[0].message).to.equal(
         'You must be logged in as an admin or as the host of this collective collective to edit it',
       );
 
-      const adminMember = await models.User.findByPk(members[3].member.createdByUser.id);
+      const member2 = members.find(m => m.member.name === 'member2');
+      const adminMember = await models.User.findByPk(member2.member.createdByUser.id);
       const res3 = await utils.graphqlQuery(query, { collective }, adminMember);
       expect(res3.errors[0].message).to.equal(
         'You cannot remove yourself as a Collective admin. If you are the only admin, please add a new one and ask them to remove you.',
@@ -849,6 +869,151 @@ describe('graphql.collective.test.js', () => {
       // console.log('>>> updatedCollective', updatedCollective);
       expect(updatedCollective.host.id).to.equal(hostCollective.id);
       expect(updatedCollective.currency).to.equal('EUR');
+    });
+  });
+  describe('edits member public message', () => {
+    const QUERY = `
+      mutation editPublicMessage($FromCollectiveId: Int!, $CollectiveId: Int!, $message: String) {
+        editPublicMessage(FromCollectiveId: $FromCollectiveId, CollectiveId: $CollectiveId, message: $message) {
+          id
+          publicMessage
+        }
+      }
+    `;
+    let pubnubCollective, pubnubHostCollective, pubnubAdmin, sandbox, cacheDelSpy;
+    cache;
+    beforeEach(async () => {
+      pubnubAdmin = (await store.newUser('pubnub admin')).user;
+      const collectiveWithHost = await store.newCollectiveWithHost('pubnub', 'USD', 'USD', 10, pubnubAdmin, {
+        isActive: true,
+      });
+      pubnubCollective = collectiveWithHost.collective;
+      pubnubHostCollective = collectiveWithHost.hostCollective;
+      sandbox = sinon.createSandbox();
+      cacheDelSpy = sandbox.spy(cache, 'del');
+    });
+    afterEach(() => sandbox.restore());
+    it('edits public message', async () => {
+      await store.stripeConnectedAccount(pubnubHostCollective.id);
+      await store.stripeOneTimeDonation({
+        remoteUser: pubnubAdmin,
+        collective: pubnubCollective,
+        currency: 'USD',
+        amount: 20000,
+      });
+      const message = 'I am happy to support this collective!';
+      const res = await utils.graphqlQuery(
+        QUERY,
+        {
+          FromCollectiveId: pubnubAdmin.collective.id,
+          CollectiveId: pubnubCollective.id,
+          message,
+        },
+        pubnubAdmin,
+      );
+      expectNotErrorsFromResult(res);
+      // Check only two members where returned by the mutation
+      expect(res.data.editPublicMessage.length).to.equal(2);
+      // Find all members modified by the mutation in the database.
+      const members = await models.Member.findAll({
+        attributes: ['id', 'publicMessage'],
+        where: {
+          MemberCollectiveId: pubnubAdmin.collective.id,
+          CollectiveId: pubnubCollective.id,
+          publicMessage: message,
+        },
+      });
+      // Check only two member were modified by the mutation in the database.
+      expect(members.length).to.equal(2);
+      // Check the two members returned by the mutation are the two members modified in the database.
+      members.forEach(member =>
+        expect(res.data.editPublicMessage).to.deep.include({ id: member.id, publicMessage: member.publicMessage }),
+      );
+      // Check contributors cache is deleted after edition
+      expect(cacheDelSpy.callCount).to.equal(1);
+      expect(cacheDelSpy.firstCall.args[0]).to.equal(`collective_contributors_${pubnubCollective.id}`);
+    });
+    it('deletes public message', async () => {
+      await store.stripeConnectedAccount(pubnubHostCollective.id);
+      await store.stripeOneTimeDonation({
+        remoteUser: pubnubAdmin,
+        collective: pubnubCollective,
+        currency: 'USD',
+        amount: 20000,
+      });
+
+      // Update the public message in the database
+      const [quantityUpdated] = await models.Member.update(
+        {
+          publicMessage: 'I am happy to contribute to this collective!',
+        },
+        {
+          where: {
+            MemberCollectiveId: pubnubAdmin.collective.id,
+            CollectiveId: pubnubCollective.id,
+          },
+        },
+      );
+      expect(quantityUpdated).to.equal(2);
+      const res = await utils.graphqlQuery(
+        QUERY,
+        {
+          FromCollectiveId: pubnubAdmin.collective.id,
+          CollectiveId: pubnubCollective.id,
+          message: null,
+        },
+        pubnubAdmin,
+      );
+      expectNotErrorsFromResult(res);
+      // Check only two members where returned by the mutation
+      expect(res.data.editPublicMessage.length).to.equal(2);
+      // Find all members modified by the mutation in the database.
+      const members = await models.Member.findAll({
+        attributes: ['id', 'publicMessage'],
+        where: {
+          MemberCollectiveId: pubnubAdmin.collective.id,
+          CollectiveId: pubnubCollective.id,
+        },
+      });
+      // Check only two member were modified by the mutation in the database.
+      expect(members.length).to.equal(2);
+      // Check the two members returned by the mutation are the two members modified in the database.
+      members.forEach(member =>
+        expect(res.data.editPublicMessage).to.deep.include({ id: member.id, publicMessage: null }),
+      );
+      // Check contributors cache is deleted after edition
+      expect(cacheDelSpy.callCount).to.equal(1);
+      expect(cacheDelSpy.firstCall.args[0]).to.equal(`collective_contributors_${pubnubCollective.id}`);
+    });
+    it('error trying to edit members public message where user is not admin', async () => {
+      const { user } = await store.newUser('test');
+      const res = await utils.graphqlQuery(
+        QUERY,
+        {
+          FromCollectiveId: user.collective.id,
+          CollectiveId: pubnubCollective.id,
+          message: 'I am happy to support this collective!',
+        },
+        pubnubAdmin,
+      );
+      expect(res.errors).to.exist;
+      expect(res.errors[0].message).to.equal("You don't have the permission to edit member public message");
+      expect(cacheDelSpy.callCount).to.equal(0);
+    });
+    it('error trying to edit members that do not exists ', async () => {
+      const { user } = await store.newUser('test');
+      const res = await utils.graphqlQuery(
+        QUERY,
+        {
+          FromCollectiveId: user.collective.id,
+          CollectiveId: pubnubCollective.id,
+          message: 'I am happy to support th0is collective!',
+        },
+        user,
+      );
+      expect(res.errors).to.exist;
+      expect(res.errors[0].message).to.equal('No member found');
+      expect(cacheDelSpy.callCount).to.equal(0);
     });
   });
 });
